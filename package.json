@@ -1,0 +1,25 @@
+{
+  "name": "grease",
+  "version": "0.1.0",
+  "description": "Copilot extension that captures friction and turns it into addressable work.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "grease": "./scripts/grease.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node --test",
+    "setup": "node scripts/install-extension-shim.mjs"
+  },
+  "keywords": [
+    "copilot",
+    "extension",
+    "friction"
+  ],
+  "author": "Marcus Markiewicz",
+  "license": "MIT"
+}
