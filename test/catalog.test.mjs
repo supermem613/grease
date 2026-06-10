@@ -86,6 +86,44 @@ test("updates are appended and applied to the derived item", async () => {
   }
 });
 
+test("concurrent updates against one store serialize safely", async () => {
+  const root = await tempRoot();
+  const originalDateNow = Date.now;
+  Date.now = () => 1781105858562;
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "grease_update",
+      error: "Tool execution failed"
+    });
+    await appendEvent(signal, { root });
+    const { items } = await searchCatalog({ query: "grease_update" }, { root });
+    assert.equal(items.length, 1);
+
+    await Promise.all([
+      updateFriction(items[0].id, {
+        status: "ignored",
+        note: "first concurrent update"
+      }, { root }),
+      updateFriction(items[0].id, {
+        tags: ["race-validated"],
+        note: "second concurrent update"
+      }, { root })
+    ]);
+
+    const updated = await getFriction(items[0].id, { root });
+    assert.equal(updated.item.status, "ignored");
+    assert.equal(updated.item.latestNote, "second concurrent update");
+    assert.ok(updated.item.tags.includes("race-validated"));
+
+    const events = await readEvents({ root });
+    assert.equal(events.filter((event) => event.type === "friction.update").length, 2);
+  } finally {
+    Date.now = originalDateNow;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function tempRoot() {
   return mkdtemp(path.join(os.tmpdir(), "grease-test-"));
 }

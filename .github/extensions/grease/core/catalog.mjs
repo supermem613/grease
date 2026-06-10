@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const CATALOG_VERSION = 4;
+const storeWriteQueues = new Map();
 
 export function defaultStoreRoot() {
   return path.join(os.homedir(), ".grease");
@@ -11,11 +12,13 @@ export function defaultStoreRoot() {
 
 export async function appendEvent(event, options = {}) {
   const root = options.root ?? defaultStoreRoot();
-  await ensureStore(root);
-  const normalized = normalizeEvent(event, options);
-  await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
-  const catalog = await rebuildCatalog({ root });
-  return { event: normalized, catalog };
+  return enqueueStoreWrite(root, async () => {
+    await ensureStore(root);
+    const normalized = normalizeEvent(event, options);
+    await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
+    const catalog = await rebuildCatalogUnlocked(root);
+    return { event: normalized, catalog };
+  });
 }
 
 export async function readEvents(options = {}) {
@@ -42,6 +45,10 @@ export async function readEvents(options = {}) {
 
 export async function rebuildCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
+  return enqueueStoreWrite(root, () => rebuildCatalogUnlocked(root));
+}
+
+async function rebuildCatalogUnlocked(root) {
   await ensureStore(root);
   const events = await readEvents({ root });
   const catalog = buildCatalog(events);
@@ -294,6 +301,18 @@ async function writeJsonAtomic(filePath, value) {
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(tempPath, filePath);
+}
+
+function enqueueStoreWrite(root, operation) {
+  const previous = storeWriteQueues.get(root) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const tracked = next.finally(() => {
+    if (storeWriteQueues.get(root) === tracked) {
+      storeWriteQueues.delete(root);
+    }
+  });
+  storeWriteQueues.set(root, tracked);
+  return next;
 }
 
 function sortItems(a, b) {
