@@ -338,3 +338,83 @@ test("diagnoses session store SQL cloud query timeouts", () => {
   assert.equal(diagnosis.queryShape.hasLimit, true);
   assert.match(diagnosis.fix, /Narrow the query before text matching/);
 });
+
+test("diagnoses GitHub MCP repository lookup misses", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "github-mcp-server-get_file_contents",
+    error: {
+      message: "MCP server 'github-mcp-server': failed to resolve git reference: failed to get repository info: GET https://api.github.com/repos/doobidoo/mcp-memory-service: 404 Not Found []",
+      code: "failure"
+    },
+    arguments: {
+      owner: "doobidoo",
+      repo: "mcp-memory-service",
+      path: "/"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(signal.signal.kind, "mcp-error");
+  assert.equal(diagnosis.category, "github-repository-not-found");
+  assert.equal(diagnosis.requestedRepository, "doobidoo/mcp-memory-service");
+  assert.equal(diagnosis.path, "/");
+  assert.match(diagnosis.fix, /Verify the owner and repo/);
+});
+
+test("diagnoses GitHub MCP code search query parse errors", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "github-mcp-server-search_code",
+    error: {
+      message: "MCP server 'github-mcp-server': failed to search code with query 'recallm RecallM in:name language:python': GET https://api.github.com/search/code?page=1&per_page=30&q=recallm+RecallM+in%3Aname+language%3Apython: 422 ERROR_TYPE_QUERY_PARSING_FATAL unable to parse query! []",
+      code: "failure"
+    },
+    arguments: {
+      query: "recallm RecallM in:name language:python"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(signal.signal.kind, "mcp-error");
+  assert.equal(diagnosis.category, "github-code-search-query-parse-error");
+  assert.equal(diagnosis.query, "recallm RecallM in:name language:python");
+  assert.deepEqual(diagnosis.unsupportedQualifiers, ["in:name"]);
+  assert.deepEqual(diagnosis.suggestedQueries, [
+    "recallm RecallM language:python",
+    "filename:recallm language:python",
+    "filename:RecallM language:python"
+  ]);
+});
+
+test("diagnoses missing file-backed MCP inputs", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "atrium-run",
+    error: {
+      message: "MCP server 'atrium': ENOENT: no such file or directory, open 'C:\\Users\\marcusm\\repos\\kb\\.persona-v2-payload.json'",
+      code: "failure"
+    },
+    arguments: {
+      tool: "python",
+      args: ["-X", "utf8", "-c", "import sys,json; json.load(sys.stdin)"],
+      stdin: {
+        file: "C:\\Users\\marcusm\\repos\\kb\\.persona-v2-payload.json"
+      },
+      cwd: "C:\\Users\\marcusm\\repos\\kb",
+      timeoutMs: 60000
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(signal.signal.kind, "mcp-error");
+  assert.equal(diagnosis.category, "missing-file-backed-input");
+  assert.equal(diagnosis.missingPath, "C:\\Users\\marcusm\\repos\\kb\\.persona-v2-payload.json");
+  assert.deepEqual(diagnosis.matchingReference, {
+    at: "stdin.file",
+    path: "C:\\Users\\marcusm\\repos\\kb\\.persona-v2-payload.json"
+  });
+  assert.equal(diagnosis.cwd, "C:\\Users\\marcusm\\repos\\kb");
+  assert.equal(diagnosis.childTool, "python");
+  assert.match(diagnosis.fix, /pass inline stdin/);
+});

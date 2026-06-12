@@ -15,6 +15,9 @@ const AGENT_NOT_FOUND = /\bagent not found\b/i;
 const MISSING_REQUIRED_FIELD = /"([^"]+)":\s*required/i;
 const WEB_FETCH_REDIRECT = /\bwebfetchredirecterror\b|\brefused to follow redirect\b/i;
 const CLOUD_QUERY_TIMEOUT = /\bcloudqueryerror\b[\s\S]*\bquery timed out\b/i;
+const GITHUB_REPOSITORY_NOT_FOUND = /\bgithub\.com\/repos\/([^/\s]+)\/([^:\s]+):\s*404\s+not\s+found\b/i;
+const GITHUB_CODE_QUERY_PARSE_ERROR = /\bsearch\/code\b[\s\S]*\b422\b[\s\S]*\bquery_parsing_fatal\b|\bunable to parse query\b/i;
+const MISSING_FILE_OPEN = /\benoent\b[\s\S]*\bno such file or directory\b[\s\S]*\bopen '([^']+)'/i;
 
 const LOCAL_TOOL_NAMES = new Set([
   "powershell",
@@ -398,6 +401,15 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments) {
   if (normalizedTool === "session_store_sql" && kind === "timeout" && CLOUD_QUERY_TIMEOUT.test(failureDetails)) {
     return sessionStoreSqlTimeoutDiagnosis(args);
   }
+  if (normalizedTool === "github-mcp-server-get_file_contents" && GITHUB_REPOSITORY_NOT_FOUND.test(failureDetails)) {
+    return githubRepositoryNotFoundDiagnosis(failureDetails, args);
+  }
+  if (normalizedTool === "github-mcp-server-search_code" && GITHUB_CODE_QUERY_PARSE_ERROR.test(failureDetails)) {
+    return githubCodeSearchQueryDiagnosis(args);
+  }
+  if (MISSING_FILE_OPEN.test(failureDetails)) {
+    return missingFileBackedInputDiagnosis(failureDetails, args);
+  }
   if (normalizedTool === "edit" && EXACT_EDIT_MISS.test(failureDetails)) {
     return {
       category: "exact-edit-miss",
@@ -485,6 +497,48 @@ function sessionStoreSqlTimeoutDiagnosis(args) {
   };
 }
 
+function githubRepositoryNotFoundDiagnosis(failureDetails, args) {
+  const fromError = GITHUB_REPOSITORY_NOT_FOUND.exec(failureDetails);
+  const owner = stringValue(args?.owner) ?? fromError?.[1];
+  const repo = stringValue(args?.repo) ?? fromError?.[2];
+  return {
+    category: "github-repository-not-found",
+    cause: "GitHub MCP could not resolve the requested repository. The owner or repo name may be wrong, the repository may be private, or the current token may not have access.",
+    fix: "Verify the owner and repo with an explicit repository lookup or user-provided URL before requesting file contents.",
+    owner,
+    repo,
+    path: stringValue(args?.path),
+    requestedRepository: owner && repo ? `${owner}/${repo}` : undefined
+  };
+}
+
+function githubCodeSearchQueryDiagnosis(args) {
+  const query = stringValue(args?.query);
+  return {
+    category: "github-code-search-query-parse-error",
+    cause: "GitHub code search could not parse the query shape.",
+    fix: "Use supported code-search qualifiers and simplify the query. Remove unsupported qualifiers such as in:name, use filename: for filenames, quote exact phrases, or split broad alternatives into separate searches.",
+    query,
+    unsupportedQualifiers: unsupportedGithubCodeSearchQualifiers(query),
+    suggestedQueries: githubCodeSearchSuggestions(query)
+  };
+}
+
+function missingFileBackedInputDiagnosis(failureDetails, args) {
+  const missingPath = unescapeJsonPath(MISSING_FILE_OPEN.exec(failureDetails)?.[1]);
+  const references = fileValueReferences(args);
+  return {
+    category: "missing-file-backed-input",
+    cause: "The MCP call referenced a local file value that did not exist when the server tried to open it.",
+    fix: "Create the file immediately before the call, pass inline stdin when the payload is short-lived, or use a durable artifact path that survives across turns and sessions.",
+    missingPath,
+    matchingReference: references.find((reference) => reference.path === missingPath),
+    fileReferences: references,
+    cwd: stringValue(args?.cwd),
+    childTool: stringValue(args?.tool)
+  };
+}
+
 function atriumXrayReplacement(rawArguments) {
   const args = normalizeToolArguments(rawArguments);
   if (!args || typeof args.pattern !== "string" || args.pattern.trim() === "") {
@@ -569,6 +623,83 @@ function queryShape(query) {
     hasLimit: /\blimit\s+\d+\b/.test(lower),
     projectedWideText: /\b(user_message|assistant_message|content|raw_event)\b/.test(lower)
   };
+}
+
+function unsupportedGithubCodeSearchQualifiers(query) {
+  const text = String(query ?? "");
+  const supported = new Set([
+    "repo",
+    "org",
+    "user",
+    "language",
+    "path",
+    "filename",
+    "extension",
+    "in",
+    "size",
+    "is"
+  ]);
+  return [...text.matchAll(/\b([A-Za-z][A-Za-z0-9_-]*):/g)]
+    .map((match) => {
+      const name = match[1];
+      const value = text.slice(match.index + match[0].length).split(/\s+/)[0];
+      if (name.toLowerCase() === "in" && !["file", "path"].includes(value.toLowerCase())) {
+        return `in:${value}`;
+      }
+      return name;
+    })
+    .filter((name) => name.includes(":") || !supported.has(name.toLowerCase()));
+}
+
+function githubCodeSearchSuggestions(query) {
+  const text = stringValue(query);
+  if (!text) {
+    return [];
+  }
+  const withoutUnsupportedInName = text.replace(/\s*\bin:name\b/gi, "");
+  const suggestions = [];
+  if (withoutUnsupportedInName !== text) {
+    suggestions.push(withoutUnsupportedInName.trim());
+  }
+  const filenameTerms = bareSearchTerms(withoutUnsupportedInName).slice(0, 2);
+  for (const term of filenameTerms) {
+    suggestions.push(replaceBareTerms(withoutUnsupportedInName, `filename:${term}`));
+  }
+  return [...new Set(suggestions.filter(Boolean))].slice(0, 3);
+}
+
+function fileValueReferences(value, pathParts = []) {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+  if (!Array.isArray(value) && typeof value.file === "string") {
+    return [{
+      at: [...pathParts, "file"].join("."),
+      path: value.file
+    }];
+  }
+  const entries = Array.isArray(value)
+    ? value.map((entry, index) => [String(index), entry])
+    : Object.entries(value);
+  return entries.flatMap(([key, entry]) => fileValueReferences(entry, [...pathParts, key]));
+}
+
+function unescapeJsonPath(value) {
+  return typeof value === "string" ? value.replace(/\\\\/g, "\\") : undefined;
+}
+
+function bareSearchTerms(query) {
+  return String(query ?? "")
+    .split(/\s+/)
+    .filter((part) => part && !part.includes(":") && !["OR", "AND", "NOT"].includes(part.toUpperCase()));
+}
+
+function replaceBareTerms(query, replacement) {
+  const qualifiers = String(query ?? "")
+    .split(/\s+/)
+    .filter((part) => part.includes(":"))
+    .join(" ");
+  return [replacement, qualifiers].filter(Boolean).join(" ");
 }
 
 function stringLength(value) {
