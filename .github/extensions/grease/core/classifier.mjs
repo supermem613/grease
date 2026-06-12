@@ -1,10 +1,20 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { redactText, summarizeValue } from "./redact.mjs";
 
 const ACCESS_DENIED = /\b(access\s+is\s+denied|access\s+denied|permission\s+denied|unauthorized|forbidden|eacces|eperm|denied|rejected)\b/i;
 const TIMEOUT = /\b(timeout|timed\s*out|deadline|etimedout|operation\s+timed\s+out)\b/i;
-const POLICY = /\b(search-policy|blocked\s+by\s+policy|content\s+exclusion|not\s+allowed|prohibited|policy\s+denied)\b/i;
+const POLICY = /\b(search-policy|blocked\s+by\s+policy|content\s+exclusion|content\s+policy|excluded\s+by\s+organization\s+content\s+policy|not\s+allowed|prohibited|policy\s+denied|denied\s+by\s+pretooluse\s+hook)\b/i;
 const USER_CORRECTION = /\b(no[,.\s]|not\s+that|wrong|you\s+missed|actually|should\s+have|do\s+not|don't)\b/i;
+const EXACT_EDIT_MISS = /\bno match found\b/i;
+const PATH_MISSING = /\bpath does not exist\b/i;
+const PARENT_DIRECTORY_MISSING = /\bparent directory does not exist\b/i;
+const PATCH_CONTEXT_MISSING = /\bfailed to find expected lines\b/i;
+const MEMORY_REPOSITORY_MISSING = /\brepository was not found\b/i;
+const AGENT_NOT_FOUND = /\bagent not found\b/i;
+const MISSING_REQUIRED_FIELD = /"([^"]+)":\s*required/i;
+const WEB_FETCH_REDIRECT = /\bwebfetchredirecterror\b|\brefused to follow redirect\b/i;
+const CLOUD_QUERY_TIMEOUT = /\bcloudqueryerror\b[\s\S]*\bquery timed out\b/i;
 
 const LOCAL_TOOL_NAMES = new Set([
   "powershell",
@@ -124,6 +134,16 @@ function classifyToolFailure(data, context) {
         durationMs: data.durationMs,
         resultType: getResultType(data),
         success: data.success,
+        guardrailRootCause: guardrailRootCauseFor(
+          toolName,
+          kind,
+          failureDetails,
+          argumentDetails,
+          workingDirectory,
+          data.arguments ?? data.toolArgs
+        ),
+        failureDiagnosis: failureDiagnosisFor(toolName, kind, failureDetails, data.arguments ?? data.toolArgs),
+        decisionContext: summarizeValue(data.decisionContext, 4000),
         error: summarizeValue(data.error, 2000),
         result: summarizeValue(data.result ?? data.toolResult, 2000),
         arguments: summarizeValue(data.arguments ?? data.toolArgs, 2000),
@@ -310,6 +330,9 @@ function summarizeToolFailure(toolName, kind, details) {
 
 function tagsForToolFailure(toolName, kind) {
   const tags = [kind];
+  if (kind === "policy-block") {
+    tags.push("guardrail");
+  }
   if (isMcpTool(toolName, {})) {
     tags.push("mcp");
   }
@@ -324,6 +347,271 @@ function severityForKind(kind) {
     return "high";
   }
   return "medium";
+}
+
+function guardrailRootCauseFor(toolName, kind, failureDetails, argumentDetails, workingDirectory, rawArguments) {
+  const details = `${failureDetails}\n${argumentDetails}`;
+  if (kind !== "policy-block" && !POLICY.test(details)) {
+    return undefined;
+  }
+  const normalizedTool = String(toolName).toLowerCase();
+  if (isDirectSearchTool(normalizedTool) && /\bsearch-policy\b/i.test(details)) {
+    return {
+      category: "direct-search-tool",
+      cause: `The agent selected blocked search tool '${toolName}' instead of the approved Atrium xray route.`,
+      fix: "Route file-content search through atrium.run with tool xray and the search subcommand.",
+      approvedReplacement: atriumXrayReplacement(rawArguments)
+    };
+  }
+  if (normalizedTool.includes("powershell") && /excluded\s+by\s+organization\s+content\s+policy/i.test(details)) {
+    return {
+      category: "shell-in-excluded-path",
+      cause: "The agent used PowerShell in or against a content-policy-excluded repository path, so command tokens were denied as excluded paths.",
+      fix: "Run from an allowed worktree or use the exposed MCP/local tool that owns the operation instead of shell probing the excluded checkout.",
+      workingDirectory
+    };
+  }
+  if (normalizedTool.includes("powershell") && /\b(atrium|uatu)\b/i.test(details)) {
+    return {
+      category: "shell-cli-fallback",
+      cause: "The agent attempted Atrium or uatu through PowerShell instead of using the exposed MCP tool surface.",
+      fix: "Use the callable MCP tool directly when exposed. If it is not exposed, capture that exposure failure rather than trying shell fallback from an excluded path."
+    };
+  }
+  return {
+    category: "guardrail-hit",
+    cause: "The agent attempted an action blocked by policy.",
+    fix: "Use the captured decisionContext to fix the prompt, skill, fallback, subagent context, or tool-selection path that selected the blocked action."
+  };
+}
+
+function isDirectSearchTool(normalizedTool) {
+  return ["grep", "rg", "ripgrep", "find", "findstr", "git grep", "select-string", "xray"].includes(normalizedTool);
+}
+
+function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments) {
+  if (kind === "policy-block") {
+    return undefined;
+  }
+  const normalizedTool = String(toolName).toLowerCase();
+  const args = normalizeToolArguments(rawArguments);
+  if (normalizedTool === "session_store_sql" && kind === "timeout" && CLOUD_QUERY_TIMEOUT.test(failureDetails)) {
+    return sessionStoreSqlTimeoutDiagnosis(args);
+  }
+  if (normalizedTool === "edit" && EXACT_EDIT_MISS.test(failureDetails)) {
+    return {
+      category: "exact-edit-miss",
+      cause: "The edit tool was asked to replace an exact old_str that no longer matched the file content.",
+      fix: "Read the current target region, then retry with a smaller current old_str or use apply_patch with fresh context.",
+      oldStringLength: stringLength(args?.old_str),
+      newStringLength: stringLength(args?.new_str)
+    };
+  }
+  if (normalizedTool === "view" && PATH_MISSING.test(failureDetails)) {
+    return {
+      category: "missing-path",
+      cause: "The view tool targeted a path that did not exist in the active filesystem context.",
+      fix: "Verify the active worktree and exact path before reading. Prefer workspace paths over stale main-checkout paths.",
+      path: stringValue(args?.path)
+    };
+  }
+  if (normalizedTool === "create" && PARENT_DIRECTORY_MISSING.test(failureDetails)) {
+    return {
+      category: "missing-parent-directory",
+      cause: "The create tool targeted a file whose parent directory did not exist.",
+      fix: "Create or choose the parent directory first, then create the file.",
+      path: stringValue(args?.path),
+      parentDirectory: parentDirectoryOf(args?.path)
+    };
+  }
+  if (normalizedTool === "apply_patch" && PATCH_CONTEXT_MISSING.test(failureDetails)) {
+    return {
+      category: "stale-patch-context",
+      cause: "The patch expected lines that were not present in the target file, usually because the file changed or the patch context was copied from a different revision.",
+      fix: "Read the current target section and regenerate the patch with exact current context.",
+      targetPath: patchTargetPath(rawArguments)
+    };
+  }
+  if (normalizedTool === "store_memory" && MEMORY_REPOSITORY_MISSING.test(failureDetails)) {
+    return {
+      category: "repository-memory-unavailable",
+      cause: "The memory request used repository scope where the repository was unavailable, inaccessible, or not enabled for repository-scoped memories.",
+      fix: "Use an available memory scope or capture the repository availability failure before retrying repository-scoped memory.",
+      scope: stringValue(args?.scope),
+      subject: stringValue(args?.subject)
+    };
+  }
+  if (normalizedTool === "read_agent" && AGENT_NOT_FOUND.test(failureDetails)) {
+    return {
+      category: "stale-agent-id",
+      cause: "The read_agent call referenced an agent id that was not live in the current session.",
+      fix: "Only read agent ids returned by this session, and refresh with list_agents when resuming after reloads or session changes.",
+      agentId: stringValue(args?.agent_id)
+    };
+  }
+  if (normalizedTool === "task") {
+    const missingField = missingRequiredField(failureDetails);
+    if (missingField) {
+      return {
+        category: "tool-schema-missing-field",
+        cause: `The task call omitted required field '${missingField}'.`,
+        fix: "Build tool calls from the declared schema and include all required fields before invocation.",
+        missingField
+      };
+    }
+  }
+  if (normalizedTool === "web_fetch" && WEB_FETCH_REDIRECT.test(failureDetails)) {
+    return {
+      category: "redirect-requires-explicit-url",
+      cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
+      fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
+      originalUrl: stringValue(args?.url),
+      redirectUrl: redirectUrlFrom(failureDetails)
+    };
+  }
+  return undefined;
+}
+
+function sessionStoreSqlTimeoutDiagnosis(args) {
+  const query = stringValue(args?.query);
+  const shape = queryShape(query);
+  return {
+    category: "session-store-query-timeout",
+    cause: "The cloud session-store query exceeded the tool timeout. The captured query shape is broad enough to require a narrower or more index-friendly lookup.",
+    fix: "Narrow the query before text matching. Prefer exact ids, tighter time windows, indexed metadata filters, fewer OR branches, and smaller projected text columns before using leading-wildcard ILIKE.",
+    description: stringValue(args?.description),
+    query,
+    queryShape: shape
+  };
+}
+
+function atriumXrayReplacement(rawArguments) {
+  const args = normalizeToolArguments(rawArguments);
+  if (!args || typeof args.pattern !== "string" || args.pattern.trim() === "") {
+    return {
+      tool: "xray",
+      args: ["search", "<query>", "--root", "<repo>", "--glob", "<scope>"]
+    };
+  }
+  const searchArgs = args.pattern.startsWith("-")
+    ? ["search", "--query", args.pattern]
+    : ["search", args.pattern];
+  const scoped = scopeForSearchPath(args.paths);
+  if (scoped.root) {
+    searchArgs.push("--root", scoped.root);
+  }
+  if (scoped.glob) {
+    searchArgs.push("--glob", scoped.glob);
+  }
+  if (args.multiline !== true && looksLikeRegex(args.pattern)) {
+    searchArgs.push("--regex");
+  }
+  if (Number.isInteger(args.head_limit)) {
+    searchArgs.push("--max", String(args.head_limit));
+  }
+  return {
+    tool: "xray",
+    args: searchArgs
+  };
+}
+
+function normalizeToolArguments(rawArguments) {
+  if (!rawArguments) {
+    return undefined;
+  }
+  if (typeof rawArguments === "object") {
+    return rawArguments;
+  }
+  if (typeof rawArguments !== "string") {
+    return undefined;
+  }
+  try {
+    return JSON.parse(rawArguments);
+  } catch {
+    return undefined;
+  }
+}
+
+function scopeForSearchPath(value) {
+  const firstPath = Array.isArray(value) ? value[0] : value;
+  if (typeof firstPath !== "string" || firstPath.trim() === "") {
+    return {};
+  }
+  const parser = /^[A-Za-z]:\\/.test(firstPath) || firstPath.includes("\\")
+    ? path.win32
+    : path;
+  const parsed = parser.parse(firstPath);
+  if (parsed.ext) {
+    return {
+      root: parser.dirname(firstPath),
+      glob: parser.basename(firstPath)
+    };
+  }
+  return {
+    root: firstPath,
+    glob: "**"
+  };
+}
+
+function looksLikeRegex(value) {
+  return /[\\^$.*+?()[\]{}|]/.test(value);
+}
+
+function queryShape(query) {
+  const text = String(query ?? "");
+  const lower = text.toLowerCase();
+  return {
+    hasLeadingWildcardIlike: /\bilike\s+'%/.test(lower),
+    ilikeCount: (lower.match(/\bilike\b/g) ?? []).length,
+    hasOr: /\bor\b/.test(lower),
+    hasTimeWindow: /\b(timestamp|first_seen_at|created_at|updated_at|last_seen_at)\b\s*[><=]/.test(lower),
+    hasOrderBy: /\border\s+by\b/.test(lower),
+    hasLimit: /\blimit\s+\d+\b/.test(lower),
+    projectedWideText: /\b(user_message|assistant_message|content|raw_event)\b/.test(lower)
+  };
+}
+
+function stringLength(value) {
+  return typeof value === "string" ? value.length : undefined;
+}
+
+function stringValue(value) {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function parentDirectoryOf(value) {
+  const filePath = stringValue(value);
+  if (!filePath) {
+    return undefined;
+  }
+  const parser = /^[A-Za-z]:\\/.test(filePath) || filePath.includes("\\")
+    ? path.win32
+    : path;
+  return parser.dirname(filePath);
+}
+
+function patchTargetPath(rawArguments) {
+  const text = typeof rawArguments === "string"
+    ? rawArguments
+    : summarizeValue(rawArguments, 4000);
+  if (!text) {
+    return undefined;
+  }
+  const match = /\*\*\* Update File:\s*(.+)/.exec(text)
+    ?? /in ([A-Za-z]:\\[^\n:]+):/.exec(text);
+  return match?.[1]?.trim();
+}
+
+function missingRequiredField(details) {
+  return MISSING_REQUIRED_FIELD.exec(details)?.[1]?.replace(/\\+$/g, "");
+}
+
+function redirectUrlFrom(details) {
+  const match = /\bto (https?:\/\/\S+)/i.exec(details);
+  if (!match) {
+    return undefined;
+  }
+  return match[1].replace(/[.,;]+$/, "");
 }
 
 function getResultType(data) {

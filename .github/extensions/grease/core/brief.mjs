@@ -1,5 +1,7 @@
 import { getFriction, searchCatalog } from "./catalog.mjs";
 
+const GUARDRAIL_TEXT = /\b(search-policy|content\s+policy|content\s+exclusion|excluded\s+by\s+organization\s+content\s+policy|denied\s+by\s+pretooluse\s+hook|blocked\s+by\s+policy|policy\s+denied)\b/i;
+
 export async function buildBrief(input = {}, options = {}) {
   const selected = [];
   if (Array.isArray(input.ids) && input.ids.length > 0) {
@@ -33,6 +35,13 @@ export async function buildBrief(input = {}, options = {}) {
       "Address these Grease friction items. Root cause each one, make the smallest safe fix, and validate the result.",
       ""
     ];
+
+  if (selected.some(({ item }) => isGuardrailItem(item))) {
+    lines.push("## Guardrail root cause");
+    lines.push("Do not fix guardrail hits by weakening the guardrail, marking them ignored, or teaching agents to bypass policy.");
+    lines.push("Root cause why the agent attempted the blocked action in the first place. Check the prompt, loaded skill instructions, tool-selection defaults, fallback path, subagent context, MCP/tool exposure, and copied command shape. Fix the source that led to the forbidden tool or path so the next agent naturally uses the approved route.");
+    lines.push("");
+  }
 
   for (const { item, occurrences } of selected) {
     lines.push(`## ${item.title}`);
@@ -74,6 +83,12 @@ export async function buildBrief(input = {}, options = {}) {
 
 function isActionableStatus(status) {
   return status !== "resolved" && status !== "ignored";
+}
+
+function isGuardrailItem(item) {
+  return item.kind === "policy-block"
+    || (item.tags ?? []).includes("guardrail")
+    || GUARDRAIL_TEXT.test(item.latestSummary ?? "");
 }
 
 function formatOrigins(item) {

@@ -70,6 +70,9 @@ test("README documents safe browser canvas instance ids for live validation", as
   const readme = await readFile(path.resolve(import.meta.dirname, "..", "README.md"), "utf8");
 
   assert.match(readme, /### Live validation/);
+  assert.match(readme, /Do not batch `extensions_reload` with `grease_\*` tool calls/);
+  assert.match(readme, /provider process is the\s+one being restarted/);
+  assert.match(readme, /Run reload as its own step/);
   assert.match(readme, /fresh browser `instanceId`/);
   assert.match(readme, /Do not reuse an `instanceId` across canvas types/);
   assert.match(readme, /CanvasInstanceIdConflictError/);

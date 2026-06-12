@@ -1,19 +1,41 @@
 export function createToolCallLedger() {
   const active = new Map();
+  const recentUserMessages = [];
+  const recentToolStarts = [];
   return {
+    rememberUserMessage(data = {}, context = {}) {
+      const content = data.content ?? data.prompt ?? data.message;
+      if (typeof content !== "string" || content.trim() === "") {
+        return;
+      }
+      recentUserMessages.push({
+        at: timestampString(data.timestamp),
+        sessionId: data.sessionId ?? context.sessionId,
+        sessionName: data.sessionName ?? context.sessionName,
+        turnId: data.turnId,
+        interactionId: data.interactionId,
+        content: content.slice(0, 2000)
+      });
+      trimTo(recentUserMessages, 3);
+    },
     rememberStart(data = {}, context = {}) {
       if (!data.toolCallId) {
         return;
       }
-      active.set(data.toolCallId, {
+      const started = {
         toolCallId: data.toolCallId,
         toolName: data.toolName,
         arguments: data.arguments,
         startedAt: timestampString(data.timestamp),
-        sessionId: context.sessionId,
-        sessionName: context.sessionName,
-        workingDirectory: data.workingDirectory ?? context.workingDirectory
-      });
+        sessionId: data.sessionId ?? context.sessionId,
+        sessionName: data.sessionName ?? context.sessionName,
+        workingDirectory: data.workingDirectory ?? context.workingDirectory,
+        turnId: data.turnId,
+        interactionId: data.interactionId
+      };
+      active.set(data.toolCallId, started);
+      recentToolStarts.push(started);
+      trimTo(recentToolStarts, 8);
     },
     enrich(data = {}, context = {}) {
       if (!data.toolCallId) {
@@ -35,10 +57,24 @@ export function createToolCallLedger() {
         durationMs: data.durationMs ?? durationMs(started.startedAt, completedAt),
         sessionId: data.sessionId ?? context.sessionId ?? started.sessionId,
         sessionName: data.sessionName ?? context.sessionName ?? started.sessionName,
-        workingDirectory: data.workingDirectory ?? context.workingDirectory ?? started.workingDirectory
+        workingDirectory: data.workingDirectory ?? context.workingDirectory ?? started.workingDirectory,
+        decisionContext: data.decisionContext ?? buildDecisionContext(started, {
+          sessionId: data.sessionId ?? context.sessionId ?? started.sessionId
+        })
       };
     }
   };
+
+  function buildDecisionContext(started, context = {}) {
+    const sessionId = context.sessionId ?? started.sessionId;
+    return {
+      recentUserMessages: relevantEntries(recentUserMessages, sessionId),
+      currentToolStart: started,
+      previousToolStarts: relevantEntries(recentToolStarts, sessionId)
+        .filter((entry) => entry.toolCallId !== started.toolCallId)
+        .slice(-5)
+    };
+  }
 }
 
 function isGenericToolName(value) {
@@ -63,4 +99,17 @@ function durationMs(startedAt, completedAt) {
     return undefined;
   }
   return end - start;
+}
+
+function relevantEntries(entries, sessionId) {
+  if (!sessionId) {
+    return [...entries];
+  }
+  return entries.filter((entry) => !entry.sessionId || entry.sessionId === sessionId);
+}
+
+function trimTo(values, maxLength) {
+  while (values.length > maxLength) {
+    values.shift();
+  }
 }

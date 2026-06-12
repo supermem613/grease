@@ -5,6 +5,7 @@ import path from "node:path";
 
 const CATALOG_VERSION = 4;
 const storeWriteQueues = new Map();
+let atomicWriteId = 0;
 
 export function defaultStoreRoot() {
   return path.join(os.homedir(), ".grease");
@@ -298,7 +299,7 @@ function catalogPath(root) {
 }
 
 async function writeJsonAtomic(filePath, value) {
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
   await rename(tempPath, filePath);
 }

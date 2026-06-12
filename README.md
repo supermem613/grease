@@ -95,6 +95,13 @@ The canvas renderer is a loopback HTTP server owned by the extension process. It
 
 ### Live validation
 
+`extensions_reload` terminates the current Grease extension process and starts a
+new one. Do not batch `extensions_reload` with `grease_*` tool calls,
+`open_canvas`, or `invoke_canvas_action` in the same parallel tool turn. Any
+Grease call in that batch can be interrupted because its provider process is the
+one being restarted. Run reload as its own step, wait for the new Grease process
+to be reported ready, then issue Grease tool or canvas calls in a later step.
+
 When validating the Grease canvas with a browser canvas, use a fresh browser `instanceId` for each run. Do not reuse an `instanceId` across canvas types or after an extension reload. Canvas instance ownership is stable, so reusing an ID such as `grease-lifecycle-debug` for a different canvas can fail with `CanvasInstanceIdConflictError`.
 
 After an extension reload, do not call `invoke_canvas_action` against an old instance. The owning provider connection may be gone, which can fail with `CanvasRuntimeError: Canvas instance "<id>" cannot be reached`. Re-issue `open_canvas` first to rehydrate the instance, then invoke actions on the returned live panel.

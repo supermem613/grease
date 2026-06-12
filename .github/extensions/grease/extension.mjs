@@ -37,6 +37,12 @@ function observeToolStart() {
 function observe(eventType) {
   session.on(eventType, (event) => {
     const data = enrichToolEvent(event.data ?? {}, event);
+    if (eventType === "user.message") {
+      toolCalls.rememberUserMessage(data, {
+        sessionId: event.sessionId,
+        sessionName: sessionNameFrom(event, data)
+      });
+    }
     recordSignals(eventType, data, {
       sessionId: event.sessionId,
       sessionName: sessionNameFrom(event, data),

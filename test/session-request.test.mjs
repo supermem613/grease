@@ -76,7 +76,7 @@ test("selected resolved items do not produce stale fix session prompts", async (
   }
 });
 
-test("policy-block prompts preserve captured evidence without owning policy guidance", async () => {
+test("policy-block prompts require guardrail root cause without weakening policy", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "grease-policy-"));
   try {
     const event = classifyManualCapture({
@@ -94,9 +94,38 @@ test("policy-block prompts preserve captured evidence without owning policy guid
     const request = await buildSessionRequest({ ids: [catalog.items[0].id] }, { root });
 
     assert.match(request.prompt, /## tool was blocked by policy/);
+    assert.match(request.prompt, /## Guardrail root cause/);
+    assert.match(request.prompt, /why the agent attempted the blocked action/);
+    assert.match(request.prompt, /Do not fix guardrail hits by weakening the guardrail/);
+    assert.match(request.prompt, /MCP\/tool exposure/);
     assert.match(request.prompt, /latest summary: Denied by preToolUse hook/);
     assert.match(request.prompt, /Grease closure/);
-    assert.doesNotMatch(request.prompt, /## Tooling constraints/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("content-policy access denials also require guardrail root cause", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-content-policy-"));
+  try {
+    const event = classifyManualCapture({
+      title: "powershell hit access denied",
+      summary: "Access denied: \"C:\\Users\\marcusm\\repos\\winch\\uatu\" is excluded by organization content policy. Do not attempt to access this file.",
+      severity: "high",
+      kind: "access-denied",
+      source: "local-tool",
+      tags: ["access-denied", "local-tool"]
+    }, {
+      sessionId: "session-1"
+    });
+    const { catalog } = await appendEvent(event, { root });
+
+    const request = await buildSessionRequest({ ids: [catalog.items[0].id] }, { root });
+
+    assert.match(request.prompt, /## Guardrail root cause/);
+    assert.match(request.prompt, /why the agent attempted the blocked action/);
+    assert.match(request.prompt, /Do not fix guardrail hits by weakening the guardrail/);
+    assert.match(request.prompt, /latest summary: Access denied/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
