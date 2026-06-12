@@ -1,9 +1,13 @@
-import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { scheduler } from "node:timers/promises";
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 const CATALOG_VERSION = 4;
+const STORE_LOCK_TIMEOUT_MS = 10_000;
+const STORE_LOCK_STALE_MS = 30_000;
+const FILE_REPLACE_TIMEOUT_MS = 2_000;
 const storeWriteQueues = new Map();
 let atomicWriteId = 0;
 
@@ -298,15 +302,24 @@ function catalogPath(root) {
   return path.join(root, "catalog.json");
 }
 
+function storeLockPath(root) {
+  return path.join(root, "catalog.lock");
+}
+
 async function writeJsonAtomic(filePath, value) {
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tempPath, filePath);
+  try {
+    await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await replaceFileWithRetry(tempPath, filePath);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function enqueueStoreWrite(root, operation) {
   const previous = storeWriteQueues.get(root) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(operation);
+  const next = previous.catch(() => undefined).then(() => withStoreLock(root, operation));
   const tracked = next.finally(() => {
     if (storeWriteQueues.get(root) === tracked) {
       storeWriteQueues.delete(root);
@@ -314,6 +327,81 @@ function enqueueStoreWrite(root, operation) {
   });
   storeWriteQueues.set(root, tracked);
   return next;
+}
+
+async function withStoreLock(root, operation) {
+  const release = await acquireStoreLock(root);
+  try {
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
+async function acquireStoreLock(root) {
+  await mkdir(root, { recursive: true });
+  const lockPath = storeLockPath(root);
+  const owner = {
+    pid: process.pid,
+    id: randomUUID(),
+    acquiredAt: new Date().toISOString()
+  };
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
+      return () => rm(lockPath, { recursive: true, force: true });
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      await removeStaleLock(lockPath);
+      if (Date.now() - startedAt > STORE_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for Grease store lock: ${lockPath}`);
+      }
+      await waitForRetry();
+    }
+  }
+}
+
+async function removeStaleLock(lockPath) {
+  let info;
+  try {
+    info = await stat(lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  if (Date.now() - info.mtimeMs <= STORE_LOCK_STALE_MS) {
+    return;
+  }
+  await rm(lockPath, { recursive: true, force: true });
+}
+
+async function replaceFileWithRetry(sourcePath, targetPath) {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await rename(sourcePath, targetPath);
+      return;
+    } catch (error) {
+      if (!isRetryableReplaceError(error) || Date.now() - startedAt > FILE_REPLACE_TIMEOUT_MS) {
+        throw error;
+      }
+      await waitForRetry();
+    }
+  }
+}
+
+function isRetryableReplaceError(error) {
+  return error?.code === "EPERM" || error?.code === "EBUSY" || error?.code === "EACCES";
+}
+
+async function waitForRetry() {
+  await scheduler.wait(25);
 }
 
 function sortItems(a, b) {

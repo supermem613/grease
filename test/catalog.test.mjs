@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { appendEvent, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
@@ -124,6 +126,68 @@ test("concurrent updates against one store serialize safely", async () => {
   }
 });
 
+test("updates from multiple processes share one store safely", async () => {
+  const root = await tempRoot();
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "grease_update",
+      error: "EPERM during rename"
+    });
+    await appendEvent(signal, { root });
+    const { items } = await searchCatalog({ query: "grease_update" }, { root });
+    assert.equal(items.length, 1);
+
+    const catalogModule = pathToFileURL(path.resolve(".github/extensions/grease/core/catalog.mjs")).href;
+    const workers = Array.from({ length: 4 }, (_, index) => runNodeModule(`
+      const { updateFriction } = await import(${JSON.stringify(catalogModule)});
+      await updateFriction(${JSON.stringify(items[0].id)}, {
+        tags: [${JSON.stringify(`process-${index}`)}],
+        note: ${JSON.stringify(`process update ${index}`)}
+      }, {
+        root: ${JSON.stringify(root)},
+        now: ${JSON.stringify(`2026-06-09T12:0${index}:00.000Z`)}
+      });
+    `));
+
+    await Promise.all(workers);
+
+    const updated = await getFriction(items[0].id, { root });
+    for (let index = 0; index < 4; index += 1) {
+      assert.ok(updated.item.tags.includes(`process-${index}`));
+    }
+    const events = await readEvents({ root });
+    assert.equal(events.filter((event) => event.type === "friction.update").length, 4);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function tempRoot() {
   return mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+}
+
+function runNodeModule(source) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`worker exited ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+      }
+    });
+  });
 }
