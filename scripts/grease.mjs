@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-import { exportCanvas } from "../.github/extensions/grease/core/canvas.mjs";
-import { getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
+import { getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction, updateFrictionBulk } from "../.github/extensions/grease/core/catalog.mjs";
 import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
-import { buildSessionRequest } from "../.github/extensions/grease/core/session-request.mjs";
 
 const VERSION = "0.1.0";
 
@@ -12,10 +10,8 @@ const registry = [
   command(["status"], "Show catalog counts and paths.", "read"),
   command(["search"], "Search friction items.", "read", ["query"], ["--status", "--limit"]),
   command(["get"], "Get one friction item with occurrences.", "read", ["id"]),
-  command(["update"], "Update a friction item.", "mutate-local", ["id"], ["--status", "--severity", "--tag", "--note"]),
-  command(["brief"], "Generate a kickoff prompt from friction items.", "read", [], ["--id", "--query", "--status", "--limit"]),
-  command(["session-request"], "Generate a structured session request.", "read", [], ["--id", "--query", "--status", "--limit"]),
-  command(["export-canvas"], "Export the Grease HTML board.", "mutate-local", [], ["--output"])
+  command(["update"], "Update one or more friction items.", "mutate-local", ["id"], ["--status", "--severity", "--tag", "--note"]),
+  command(["brief"], "Generate a kickoff prompt from friction items.", "read", [], ["--id", "--query", "--status", "--limit"])
 ];
 
 try {
@@ -36,7 +32,7 @@ try {
 async function dispatch(name, argv) {
   const parsed = parseArgs(argv);
   if (name === "help" || name === "--help") {
-    return ok("help", { usage: "grease <schema|doctor|status|search|get|update|brief|session-request|export-canvas>" });
+    return ok("help", { usage: "grease <schema|doctor|status|search|get|update|brief>" });
   }
   if (name === "schema") {
     return ok("schema", schema(parsed.flags.summary === true));
@@ -74,15 +70,23 @@ async function dispatch(name, argv) {
     return ok("get", await getFriction(id));
   }
   if (name === "update") {
-    const id = parsed.positionals[0];
-    if (!id) throw new Error("update requires an id");
+    const ids = parsed.positionals;
+    if (ids.length === 0) throw new Error("update requires an id");
     const tags = arrayFlag(parsed.flags.tag);
-    const result = await updateFriction(id, {
+    const updates = {
       status: parsed.flags.status,
       severity: parsed.flags.severity,
       tags: tags.length > 0 ? tags : undefined,
       note: parsed.flags.note
-    });
+    };
+    if (ids.length > 1) {
+      const result = await updateFrictionBulk(ids, updates);
+      return ok("update", {
+        itemIds: result.ids,
+        itemCount: result.catalog.items.length
+      });
+    }
+    const result = await updateFriction(ids[0], updates);
     return ok("update", {
       eventId: result.event.id,
       itemCount: result.catalog.items.length
@@ -90,12 +94,6 @@ async function dispatch(name, argv) {
   }
   if (name === "brief") {
     return ok("brief", await buildBrief(requestInput(parsed)));
-  }
-  if (name === "session-request") {
-    return ok("session-request", await buildSessionRequest(requestInput(parsed)));
-  }
-  if (name === "export-canvas") {
-    return ok("export-canvas", await exportCanvas({ outputPath: parsed.flags.output }));
   }
   throw new Error(`Unknown command: ${name}`);
 }

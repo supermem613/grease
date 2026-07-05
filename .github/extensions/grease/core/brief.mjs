@@ -29,7 +29,7 @@ export async function buildBrief(input = {}, options = {}) {
     ? [
       "No active Grease friction items matched this request.",
       "",
-      "The selected items may already be resolved or ignored. Refresh the Grease canvas before creating a fix session."
+      "The selected items may already be resolved or ignored. Search for open items before creating a fix session."
     ]
     : [
       "Address these Grease friction items. Root cause each one, make the smallest safe fix, and validate the result.",

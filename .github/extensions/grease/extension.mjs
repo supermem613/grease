@@ -1,7 +1,6 @@
 import { joinSession } from "@github/copilot-sdk/extension";
 import { appendEvent } from "./core/catalog.mjs";
 import { classifySessionEvent } from "./core/classifier.mjs";
-import { createGreaseCanvas } from "./core/canvas-provider.mjs";
 import { createGreaseTools } from "./core/tools.mjs";
 import { createToolCallLedger } from "./core/tool-call-ledger.mjs";
 
@@ -55,11 +54,6 @@ function observe(eventType) {
 
 session = await joinSession({
   tools: createGreaseTools(),
-  canvases: [
-    createGreaseCanvas({
-      getSession: () => session
-    })
-  ],
   hooks: {
     onPostToolUseFailure: async (input, invocation) => {
       const data = enrichToolEvent(input, invocation);

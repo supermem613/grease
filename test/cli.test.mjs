@@ -9,7 +9,7 @@ test("CLI schema summary is machine-readable JSON", async () => {
   assert.equal(result.ok, true);
   assert.equal(result.command, "schema");
   assert.equal(result.data.schemaVersion, 1);
-  assert.ok(result.data.commandPaths.some((pathParts) => pathParts[0] === "session-request"));
+  assert.ok(result.data.commandPaths.some((pathParts) => pathParts[0] === "brief"));
 });
 
 test("CLI doctor is machine-readable JSON", async () => {

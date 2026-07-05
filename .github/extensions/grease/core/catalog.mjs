@@ -125,22 +125,7 @@ export async function updateFriction(id, updates, options = {}) {
   if (!id) {
     throw new Error("id is required");
   }
-  const allowed = {};
-  if (updates.status !== undefined) {
-    allowed.status = requireOneOf(updates.status, ["open", "triaged", "in-progress", "resolved", "ignored"], "status");
-  }
-  if (updates.severity !== undefined) {
-    allowed.severity = requireOneOf(updates.severity, ["low", "medium", "high", "critical"], "severity");
-  }
-  if (updates.tags !== undefined) {
-    if (!Array.isArray(updates.tags)) {
-      throw new Error("tags must be an array");
-    }
-    allowed.tags = [...new Set(updates.tags.map((tag) => String(tag).trim()).filter(Boolean))];
-  }
-  if (updates.note !== undefined) {
-    allowed.note = String(updates.note);
-  }
+  const allowed = normalizeFrictionUpdates(updates);
   const event = {
     type: "friction.update",
     at: options.now ?? new Date().toISOString(),
@@ -148,6 +133,32 @@ export async function updateFriction(id, updates, options = {}) {
     updates: allowed
   };
   return appendEvent(event, options);
+}
+
+export async function updateFrictionBulk(ids, updates, options = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error("ids must be a non-empty array");
+  }
+  const allowed = normalizeFrictionUpdates(updates);
+  const root = options.root ?? defaultStoreRoot();
+  const at = options.now ?? new Date().toISOString();
+  return enqueueStoreWrite(root, async () => {
+    await ensureStore(root);
+    for (const id of ids) {
+      if (!id) {
+        throw new Error("id is required");
+      }
+      const normalized = normalizeEvent({
+        type: "friction.update",
+        at,
+        itemId: id,
+        updates: allowed
+      }, options);
+      await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
+    }
+    const catalog = await rebuildCatalogUnlocked(root);
+    return { ids, catalog };
+  });
 }
 
 export function buildCatalog(events) {
@@ -246,14 +257,12 @@ export function pathsForStore(root = defaultStoreRoot()) {
   return {
     root,
     events: eventsPath(root),
-    catalog: catalogPath(root),
-    canvasDir: path.join(root, "canvas")
+    catalog: catalogPath(root)
   };
 }
 
 async function ensureStore(root) {
   await mkdir(root, { recursive: true });
-  await mkdir(path.join(root, "canvas"), { recursive: true });
 }
 
 function normalizeEvent(event, options) {
@@ -456,6 +465,26 @@ function originKey(origin) {
     origin.sessionId,
     origin.workingDirectory
   ].map((value) => String(value ?? "")).join("\u001f");
+}
+
+function normalizeFrictionUpdates(updates) {
+  const allowed = {};
+  if (updates.status !== undefined) {
+    allowed.status = requireOneOf(updates.status, ["open", "triaged", "in-progress", "resolved", "ignored"], "status");
+  }
+  if (updates.severity !== undefined) {
+    allowed.severity = requireOneOf(updates.severity, ["low", "medium", "high", "critical"], "severity");
+  }
+  if (updates.tags !== undefined) {
+    if (!Array.isArray(updates.tags)) {
+      throw new Error("tags must be an array");
+    }
+    allowed.tags = [...new Set(updates.tags.map((tag) => String(tag).trim()).filter(Boolean))];
+  }
+  if (updates.note !== undefined) {
+    allowed.note = String(updates.note);
+  }
+  return allowed;
 }
 
 function requireOneOf(value, allowed, name) {

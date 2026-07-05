@@ -1,8 +1,6 @@
-import { appendEvent, getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction } from "./catalog.mjs";
+import { appendEvent, getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction, updateFrictionBulk } from "./catalog.mjs";
 import { buildBrief } from "./brief.mjs";
 import { classifyManualCapture } from "./classifier.mjs";
-import { exportCanvas } from "./canvas.mjs";
-import { buildSessionRequest } from "./session-request.mjs";
 
 export function createGreaseTools(options = {}) {
   return [
@@ -91,20 +89,27 @@ export function createGreaseTools(options = {}) {
     },
     {
       name: "grease_update",
-      description: "Update a Grease friction item's status, severity, tags, or note.",
+      description: "Update one or more Grease friction items' status, severity, tags, or note. Pass id for one item or ids for an atomic bulk update.",
       parameters: {
         type: "object",
         properties: {
           id: { type: "string" },
+          ids: { type: "array", items: { type: "string" } },
           status: { type: "string", enum: ["open", "triaged", "in-progress", "resolved", "ignored"] },
           severity: { type: "string", enum: ["low", "medium", "high", "critical"] },
           tags: { type: "array", items: { type: "string" } },
           note: { type: "string" }
-        },
-        required: ["id"]
+        }
       },
       handler: async (args) => {
-        const { id, ...updates } = args;
+        const { id, ids, ...updates } = args;
+        if (Array.isArray(ids) && ids.length > 0) {
+          const result = await updateFrictionBulk(ids, updates, options);
+          return success("grease_update", {
+            itemIds: result.ids,
+            itemCount: result.catalog.items.length
+          });
+        }
         const result = await updateFriction(id, updates, options);
         return success("grease_update", {
           eventId: result.event.id,
@@ -126,35 +131,6 @@ export function createGreaseTools(options = {}) {
       },
       handler: async (args) => {
         return success("grease_brief", await buildBrief(args, options));
-      }
-    },
-    {
-      name: "grease_export_canvas",
-      description: "Export a canvas-ready HTML board for the Grease friction catalog.",
-      parameters: {
-        type: "object",
-        properties: {
-          outputPath: { type: "string" }
-        }
-      },
-      handler: async (args) => {
-        return success("grease_export_canvas", await exportCanvas(args, options));
-      }
-    },
-    {
-      name: "grease_session_request",
-      description: "Prepare a structured Copilot session request from selected or searched Grease friction items.",
-      parameters: {
-        type: "object",
-        properties: {
-          ids: { type: "array", items: { type: "string" } },
-          query: { type: "string" },
-          status: { type: "string" },
-          limit: { type: "number" }
-        }
-      },
-      handler: async (args) => {
-        return success("grease_session_request", await buildSessionRequest(args, options));
       }
     }
   ];
