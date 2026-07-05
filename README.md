@@ -81,6 +81,8 @@ Non-interactive commands write JSON only to stdout. The `schema` command is the 
 
 The `grease-triage` skill drives the headless triage loop end to end: capture, status, search or get, brief, then update items individually or in bulk. See `skills/grease-triage/SKILL.md`.
 
+Skills and extensions are separate Copilot subsystems: the extension registers tools and hooks, while skills are discovered from the skills directories. `npm run setup` installs both from a single command (see below), so the skills activate alongside the tools.
+
 ## Install for local use
 
 From a clone of this repo:
@@ -90,9 +92,14 @@ npm install
 npm run setup
 ```
 
-`npm run setup` runs `scripts/install-extension-shim.mjs`, which writes a one-line `extension.mjs` shim into `~/.copilot/extensions/grease/` that imports back into the clone. Then reload Copilot extensions.
+`npm run setup` runs `scripts/install-extension-shim.mjs`, which:
 
-The install script is self-locating — it resolves the repo root from its own file location, so no paths need to be edited.
+- writes a one-line `extension.mjs` shim into `~/.copilot/extensions/grease/` that imports back into the clone, activating the agent tools and passive hooks, and
+- links every skill under `skills/` into `~/.copilot/skills/` as a directory junction, so the `grease-triage` and `grease-install` skills are discovered as personal Copilot skills.
+
+Both the extension shim and the skill junctions point back at this clone rather than copying it, so edits you make in the repo are picked up the next time Copilot loads. Reload Copilot extensions (and skills) after running setup, or after editing extension or skill files.
+
+The install script is self-locating — it resolves the repo root from its own file location, so no paths need to be edited. It refuses to overwrite a real (non-linked) skill directory it does not own.
 
 ## Development
 
