@@ -64,15 +64,15 @@ The extension registers these six tools:
 
 ## Programmatic CLI
 
-Grease also ships a dependency-free CLI for scripts and agents:
+Grease also ships a dependency-free CLI for scripts and agents. Run these from the repo root:
 
 ```powershell
-node scripts\grease.mjs schema --summary
-node scripts\grease.mjs status
-node scripts\grease.mjs search atrium --limit 5
-node scripts\grease.mjs brief --query atrium --limit 3
-node scripts\grease.mjs update <id> --status resolved --note "Fixed and validated"
-node scripts\grease.mjs update <id1> <id2> <id3> --status resolved --note "Closed in bulk"
+node ./scripts/grease.mjs schema --summary
+node ./scripts/grease.mjs status
+node ./scripts/grease.mjs search atrium --limit 5
+node ./scripts/grease.mjs brief --query atrium --limit 3
+node ./scripts/grease.mjs update <id> --status resolved --note "Fixed and validated"
+node ./scripts/grease.mjs update <id1> <id2> <id3> --status resolved --note "Closed in bulk"
 ```
 
 Non-interactive commands write JSON only to stdout. The `schema` command is the source of truth for supported commands.
