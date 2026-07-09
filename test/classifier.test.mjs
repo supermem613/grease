@@ -337,6 +337,93 @@ test("diagnoses session store SQL cloud query timeouts", () => {
   assert.equal(diagnosis.queryShape.hasOrderBy, true);
   assert.equal(diagnosis.queryShape.hasLimit, true);
   assert.match(diagnosis.fix, /Narrow the query before text matching/);
+  assert.match(diagnosis.planning.suggestedQueries.join("\n"), /session_files/);
+  assert.match(diagnosis.planning.suggestedQueries.join("\n"), /file_path/);
+});
+
+test("diagnoses session store SQL timeout planning guidance", () => {
+  const cases = [
+    {
+      description: "Find turns with architecture references",
+      query: "SELECT id, session_id, message, created_at FROM turns WHERE message ILIKE '%architecture%' ORDER BY created_at DESC LIMIT 50",
+      expectedPlanningHint: /first identify candidate session_id values before scanning message text/i,
+      expectedSuggestedQuery: /turns[\s\S]*%architecture%/,
+      expectedFix: /Narrow the query before text matching/
+    },
+    {
+      description: "Find recent sessions for architecture doc",
+      query: "SELECT session_id, created_at, last_event_at FROM sessions WHERE created_at > NOW() - INTERVAL '7 days' ORDER BY created_at DESC LIMIT 100",
+      expectedSuggestedQuery: /sessions/,
+      expectedPlanningHint: /recency window, ORDER BY, and LIMIT/i,
+      expectedRiskLevel: "medium-risk",
+      expectedFix: /Preserve the recency window, ORDER BY, and LIMIT/
+    },
+    {
+      description: "Find turns user messages with architecture references",
+      query: "SELECT session_id, user_message, timestamp FROM turns WHERE user_message ILIKE '%architecture%' ORDER BY timestamp DESC LIMIT 25",
+      expectedSuggestedQuery: /turns[\s\S]*user_message[\s\S]*%architecture%/,
+      expectedPlanningHint: /first identify candidate session_id values before scanning message text/i,
+      expectedRiskLevel: "high-risk",
+      expectedFix: /Narrow the query before text matching/
+    },
+    {
+      description: "Find user messages for a specific session by text",
+      query: "SELECT session_id, user_message, timestamp FROM turns WHERE session_id = 'session-84' AND user_message ILIKE '%architecture%' ORDER BY timestamp DESC LIMIT 25",
+      expectedSuggestedQuery: /turns[\s\S]*session-84[\s\S]*user_message[\s\S]*%architecture%/,
+      expectedPlanningHint: /Keep the exact session_id filter/i,
+      expectedRiskLevel: "medium-risk",
+      expectedFix: /Keep the exact session_id filter/
+    },
+    {
+      description: "Find tool requests for a specific session by text",
+      query: "SELECT id, session_id, tool_name, created_at FROM tool_requests WHERE session_id = 'session-42' AND tool_name ILIKE '%arch%' ORDER BY created_at DESC LIMIT 20",
+      expectedSuggestedQuery: /tool_requests[\s\S]*session-42/,
+      expectedRiskLevel: "medium-risk",
+      expectedFix: /Keep the exact session_id filter/
+    }
+  ];
+
+  for (const testCase of cases) {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "session_store_sql",
+      error: {
+        message: "CloudQueryError: {\"documentation_url\":\"\",\"message\":\"query timed out\"}\n",
+        code: "failure"
+      },
+      arguments: {
+        description: testCase.description,
+        query: testCase.query
+      }
+    });
+
+    const diagnosis = signal.signal.evidence.failureDiagnosis;
+    assert.equal(signal.signal.kind, "timeout");
+    assert.equal(diagnosis.category, "session-store-query-timeout");
+    assert.equal(diagnosis.description, testCase.description);
+    assert.match(diagnosis.fix, testCase.expectedFix);
+    assert.ok(diagnosis.planning);
+    assert.ok(diagnosis.planning.riskLevel);
+    if (testCase.expectedRiskLevel) {
+      assert.equal(diagnosis.planning.riskLevel, testCase.expectedRiskLevel);
+    }
+    assert.ok(Array.isArray(diagnosis.planning.risks) && diagnosis.planning.risks.length > 0);
+    assert.ok(Array.isArray(diagnosis.planning.recommendedSteps) && diagnosis.planning.recommendedSteps.length > 0);
+
+    const planningText = [
+      diagnosis.planning.riskLevel,
+      ...diagnosis.planning.risks,
+      ...diagnosis.planning.recommendedSteps
+    ].join("\n");
+
+    assert.match(diagnosis.planning.suggestedQueries.join("\n"), testCase.expectedSuggestedQuery);
+
+    if (testCase.expectedPlanningHint) {
+      assert.ok(Array.isArray(diagnosis.planning.suggestedQueries) && diagnosis.planning.suggestedQueries.length > 0);
+      assert.match(planningText, testCase.expectedPlanningHint);
+      assert.match(planningText, /safer|candidate|session_id/i);
+    }
+  }
 });
 
 test("diagnoses GitHub MCP repository lookup misses", () => {
