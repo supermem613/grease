@@ -115,6 +115,7 @@ No runtime dependencies are required. `@github/copilot-sdk` is host-injected by 
 
 - One extension product owns capture, storage, and tools.
 - Capture and interpretation are separate. Events are logged first; catalog compaction groups them into durable items.
+- Session-store timeout captures can include deterministic query-shape planning guidance as local catalog context, so the same friction can be briefed and closed with a repeatable plan.
 - Grease does not create sessions directly. `grease_brief` produces the kickoff prompt that a session creation flow can use.
 
 ## License

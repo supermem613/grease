@@ -39,6 +39,8 @@ Pull all open items and cluster them by tool, error signature, and path family b
 
 Only codify a new instruction when the cause is all three: deterministic, recurring across sessions, and not already governed. One-offs and already-governed items are closed, never met with new instructions. Piling instructions for hygiene is friction, not a fix.
 
+For session-store timeout items, use any captured planning guidance in the item's local evidence when you brief a fix-it session or close the item. Treat that guidance as part of the recorded item context, not as a separate signal from outside Grease.
+
 ### Caller-side vs tool defect
 
 A tool that errors correctly on bad input (missing file, bad root, malformed arguments) is caller-side: fix the caller, usually an instruction. A tool that fails on valid input is a defect: fix or relay it. Do not relay caller-side errors.

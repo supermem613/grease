@@ -490,11 +490,129 @@ function sessionStoreSqlTimeoutDiagnosis(args) {
   return {
     category: "session-store-query-timeout",
     cause: "The cloud session-store query exceeded the tool timeout. The captured query shape is broad enough to require a narrower or more index-friendly lookup.",
-    fix: "Narrow the query before text matching. Prefer exact ids, tighter time windows, indexed metadata filters, fewer OR branches, and smaller projected text columns before using leading-wildcard ILIKE.",
+    fix: sessionStoreSqlTimeoutFix(shape),
     description: stringValue(args?.description),
     query,
-    queryShape: shape
+    queryShape: shape,
+    planning: sessionStoreSqlTimeoutPlanning(query, shape)
   };
+}
+
+function sessionStoreSqlTimeoutFix(shape) {
+  if (shape?.hasTextScan && shape?.hasExactSessionFilter) {
+    return "Keep the exact session_id filter and reduce projected columns before running any bounded follow-up text match.";
+  }
+  if (shape?.hasTextScan) {
+    return "Narrow the query before text matching. Prefer exact ids, tighter time windows, indexed metadata filters, fewer OR branches, and smaller projected text columns before using leading-wildcard ILIKE.";
+  }
+  return "Preserve the recency window, ORDER BY, and LIMIT, then reduce projected columns or split follow-up inspection by exact session_id values.";
+}
+
+function sessionStoreSqlTimeoutPlanning(query, shape) {
+  const normalizedQuery = stringValue(query) ?? "";
+  const queryInfo = sessionStoreQueryInfo(normalizedQuery);
+  const broadTextScan = Boolean(shape?.hasTextScan && shape?.hasOrderBy && (shape?.hasTimeWindow || shape?.hasOr || shape?.projectedWideText));
+  const exactSessionTextScan = Boolean(shape?.hasExactSessionFilter && shape?.hasTextScan);
+  const riskLevel = exactSessionTextScan ? "medium-risk" : broadTextScan ? "high-risk" : "medium-risk";
+  const risks = [];
+  if (exactSessionTextScan) {
+    risks.push("The query mixes an exact session_id filter with text matching, which can still be more expensive than a bounded metadata lookup.");
+    if (shape?.projectedWideText) {
+      risks.push("The projection includes wide text columns that are not needed for the first bounded lookup.");
+    }
+  } else if (broadTextScan) {
+    risks.push("The query scans message or event text across a broad candidate set without a narrowed session identifier.");
+    if (shape?.hasOr) {
+      risks.push("Broad OR branches increase the cost of the text scan.");
+    }
+    if (shape?.projectedWideText) {
+      risks.push("Wide text projections add extra data movement before any narrowing filter can apply.");
+    }
+  } else {
+    risks.push("The query timed out despite already using bounded result-shaping clauses.");
+  }
+
+  const recommendedSteps = [];
+  if (exactSessionTextScan) {
+    recommendedSteps.push("Keep the exact session_id filter.");
+    recommendedSteps.push("Remove extra text projection or split text matching into a second bounded query.");
+    recommendedSteps.push("Project only the metadata needed for the first lookup and keep the follow-up text query tight.");
+  } else if (broadTextScan) {
+    recommendedSteps.push("First identify candidate session_id values before scanning message text.");
+    recommendedSteps.push("Use session_refs, sessions, or exact metadata filters to reduce the candidate set before the text scan.");
+    recommendedSteps.push("Keep the follow-up text scan bounded with a recency window, ORDER BY, and LIMIT.");
+    recommendedSteps.push("If text matching remains necessary, split it into a second query that only reads the narrowed session_id set.");
+  } else {
+    recommendedSteps.push("Keep the recency window, ORDER BY, and LIMIT that bound the result set.");
+    recommendedSteps.push("Reduce the projection to the smallest metadata columns needed for the first lookup.");
+    recommendedSteps.push("If the bounded query still times out, split follow-up inspection by exact session_id values.");
+  }
+
+  const suggestedQueries = [];
+  if (exactSessionTextScan) {
+    suggestedQueries.push(exactSessionMetadataQuery(queryInfo));
+    suggestedQueries.push(exactSessionTextQuery(queryInfo));
+  } else if (broadTextScan) {
+    suggestedQueries.push(candidateSessionQuery(queryInfo));
+    suggestedQueries.push(narrowedTextQuery(queryInfo));
+  } else {
+    suggestedQueries.push(candidateSessionQuery(queryInfo));
+  }
+
+  return {
+    riskLevel,
+    risks: stableUnique(risks),
+    recommendedSteps: stableUnique(recommendedSteps),
+    suggestedQueries: stableUnique(suggestedQueries)
+  };
+}
+
+function sessionStoreQueryInfo(query) {
+  const table = /\bfrom\s+([a-z_][a-z0-9_]*)\b/i.exec(query)?.[1] ?? "sessions";
+  const lower = query.toLowerCase();
+  const timeColumn = ["timestamp", "first_seen_at", "created_at", "updated_at", "last_seen_at"].find((column) => lower.includes(column));
+  const matchedTextColumn = /\b([a-z_][a-z0-9_]*)\s+(?:ilike|like)\b/i.exec(query)?.[1];
+  const textColumn = matchedTextColumn ?? ["user_message", "assistant_message", "message", "content", "raw_event", "tool_name", "file_path", "text"].find((column) => lower.includes(column));
+  const limit = /\blimit\s+(\d+)\b/i.exec(query)?.[1] ?? "50";
+  const likePattern = /\b(?:ilike|like)\s+('[^']*'|"[^"]*")/i.exec(query)?.[1] ?? "'%<text>%'";
+  const sessionId = /\bsession_id\s*=\s*('[^']*'|"[^"]*")/i.exec(query)?.[1];
+  return {
+    table,
+    timeColumn,
+    textColumn,
+    limit,
+    likePattern,
+    sessionId
+  };
+}
+
+function candidateSessionQuery(info) {
+  const sessionColumn = info.table === "sessions" ? "id AS session_id" : "session_id";
+  const where = info.timeColumn ? ` WHERE ${info.timeColumn} > NOW() - INTERVAL '7 days'` : "";
+  const order = info.timeColumn ? ` ORDER BY ${info.timeColumn} DESC` : "";
+  return `SELECT ${sessionColumn} FROM ${info.table}${where}${order} LIMIT 100`;
+}
+
+function narrowedTextQuery(info) {
+  const textFilter = info.textColumn ? ` AND ${info.textColumn} ILIKE ${info.likePattern}` : "";
+  const projection = stableUnique(["session_id", info.textColumn, info.timeColumn]).join(", ");
+  const order = info.timeColumn ? ` ORDER BY ${info.timeColumn} DESC` : "";
+  return `SELECT ${projection} FROM ${info.table} WHERE session_id IN (<candidate session_id values>)${textFilter}${order} LIMIT ${info.limit}`;
+}
+
+function exactSessionMetadataQuery(info) {
+  const sessionId = info.sessionId ?? "'<session_id>'";
+  const projection = stableUnique(["session_id", info.timeColumn]).join(", ");
+  const order = info.timeColumn ? ` ORDER BY ${info.timeColumn} DESC` : "";
+  return `SELECT ${projection} FROM ${info.table} WHERE session_id = ${sessionId}${order} LIMIT ${info.limit}`;
+}
+
+function exactSessionTextQuery(info) {
+  const sessionId = info.sessionId ?? "'<session_id>'";
+  const textFilter = info.textColumn ? ` AND ${info.textColumn} ILIKE ${info.likePattern}` : "";
+  const projection = stableUnique(["session_id", info.textColumn, info.timeColumn]).join(", ");
+  const order = info.timeColumn ? ` ORDER BY ${info.timeColumn} DESC` : "";
+  return `SELECT ${projection} FROM ${info.table} WHERE session_id = ${sessionId}${textFilter}${order} LIMIT ${info.limit}`;
 }
 
 function githubRepositoryNotFoundDiagnosis(failureDetails, args) {
@@ -617,11 +735,13 @@ function queryShape(query) {
   return {
     hasLeadingWildcardIlike: /\bilike\s+'%/.test(lower),
     ilikeCount: (lower.match(/\bilike\b/g) ?? []).length,
+    hasTextScan: /\b(user_message|assistant_message|message|content|raw_event|tool_name|file_path|text)\b/.test(lower) && /\b(ilike|like)\b/.test(lower),
+    hasExactSessionFilter: /\bsession_id\s*=\s*('[^']*'|"[^"]*")/.test(lower),
     hasOr: /\bor\b/.test(lower),
     hasTimeWindow: /\b(timestamp|first_seen_at|created_at|updated_at|last_seen_at)\b\s*[><=]/.test(lower),
     hasOrderBy: /\border\s+by\b/.test(lower),
     hasLimit: /\blimit\s+\d+\b/.test(lower),
-    projectedWideText: /\b(user_message|assistant_message|content|raw_event)\b/.test(lower)
+    projectedWideText: /\b(user_message|assistant_message|message|content|raw_event)\b/.test(lower)
   };
 }
 
@@ -682,6 +802,10 @@ function fileValueReferences(value, pathParts = []) {
     ? value.map((entry, index) => [String(index), entry])
     : Object.entries(value);
   return entries.flatMap(([key, entry]) => fileValueReferences(entry, [...pathParts, key]));
+}
+
+function stableUnique(values) {
+  return values.filter((value, index, list) => value !== undefined && value !== null && list.indexOf(value) === index);
 }
 
 function unescapeJsonPath(value) {
