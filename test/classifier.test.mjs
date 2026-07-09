@@ -225,6 +225,74 @@ test("diagnoses missing view paths", () => {
   assert.equal(signal.signal.evidence.failureDiagnosis.path, "C:\\Users\\marcusm\\repos\\winch\\tests\\Missing.cs");
 });
 
+test("diagnoses stale known-path reads with discovery-first recovery", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "view",
+    error: { message: "Path does not exist", code: "failure" },
+    arguments: {
+      path: "C:\\Users\\marcusm\\.sd\\sidequests\\sd-schema-upgrade-system\\src\\merge\\chunks.ts"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "known-path-read-preflight");
+  assert.equal(diagnosis.path, "C:\\Users\\marcusm\\.sd\\sidequests\\sd-schema-upgrade-system\\src\\merge\\chunks.ts");
+  assert.match(diagnosis.reason, /stale|unproven/i);
+
+  const recoveryCandidates = [];
+  if (typeof diagnosis.recovery === "string") {
+    recoveryCandidates.push(diagnosis.recovery);
+  } else {
+    if (diagnosis.recovery?.text) {
+      recoveryCandidates.push(diagnosis.recovery.text);
+    }
+    if (Array.isArray(diagnosis.recovery?.steps)) {
+      recoveryCandidates.push(...diagnosis.recovery.steps);
+    }
+  }
+  const recoveryText = recoveryCandidates.join("\n");
+  assert.match(recoveryText, /re-derive|discovery/i);
+});
+
+test("routes proven file-backed output paths to atrium-read", () => {
+  const path = "C:\\Users\\marcusm\\AppData\\Local\\Temp\\atrium\\reads\\abc\\content.txt";
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "view",
+    error: { message: "Path does not exist", code: "failure" },
+    arguments: {
+      path
+    },
+    decisionContext: {
+      previousToolStarts: [{
+        toolName: "atrium.run",
+        result: {
+          file: path
+        }
+      }]
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "known-path-read-preflight");
+
+  const recoveryCandidates = [];
+  if (typeof diagnosis.recovery === "string") {
+    recoveryCandidates.push(diagnosis.recovery);
+  } else {
+    if (diagnosis.recovery?.text) {
+      recoveryCandidates.push(diagnosis.recovery.text);
+    }
+    if (Array.isArray(diagnosis.recovery?.steps)) {
+      recoveryCandidates.push(...diagnosis.recovery.steps);
+    }
+  }
+  const recoveryText = recoveryCandidates.join("\n");
+  assert.match(recoveryText, /atrium-read/i);
+  assert.match(recoveryText, /startLine|count|endLine|bounded/i);
+});
+
 test("diagnoses create calls with missing parent directories", () => {
   const [signal] = classifySessionEvent("tool.execution_complete", {
     success: false,

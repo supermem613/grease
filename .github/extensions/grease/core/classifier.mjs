@@ -145,7 +145,7 @@ function classifyToolFailure(data, context) {
           workingDirectory,
           data.arguments ?? data.toolArgs
         ),
-        failureDiagnosis: failureDiagnosisFor(toolName, kind, failureDetails, data.arguments ?? data.toolArgs),
+        failureDiagnosis: failureDiagnosisFor(toolName, kind, failureDetails, data.arguments ?? data.toolArgs, data.decisionContext),
         decisionContext: summarizeValue(data.decisionContext, 4000),
         error: summarizeValue(data.error, 2000),
         result: summarizeValue(data.result ?? data.toolResult, 2000),
@@ -392,12 +392,55 @@ function isDirectSearchTool(normalizedTool) {
   return ["grep", "rg", "ripgrep", "find", "findstr", "git grep", "select-string", "xray"].includes(normalizedTool);
 }
 
-function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments) {
+function collectFileBackedPaths(...sources) {
+  const paths = [];
+  const visited = new WeakSet();
+
+  const visit = (value) => {
+    if (value === null || value === undefined) {
+      return;
+    }
+    if (typeof value !== "object") {
+      return;
+    }
+    if (visited.has(value)) {
+      return;
+    }
+    visited.add(value);
+
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "file" && typeof child === "string") {
+        const trimmed = child.trim();
+        if (trimmed) {
+          paths.push(trimmed);
+        }
+      }
+      visit(child);
+    }
+  };
+
+  sources.filter(Boolean).forEach(visit);
+  return paths;
+}
+
+function isKnownSidequestPath(value) {
+  const text = stringValue(value);
+  return Boolean(text && /(?:^|[\\/])\.sd[\\/]+sidequests[\\/]/i.test(text));
+}
+
+function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decisionContext) {
   if (kind === "policy-block") {
     return undefined;
   }
   const normalizedTool = String(toolName).toLowerCase();
   const args = normalizeToolArguments(rawArguments);
+  const currentPath = stringValue(args?.path);
+  const knownFileBackedPaths = collectFileBackedPaths(args, decisionContext);
   if (normalizedTool === "session_store_sql" && kind === "timeout" && CLOUD_QUERY_TIMEOUT.test(failureDetails)) {
     return sessionStoreSqlTimeoutDiagnosis(args);
   }
@@ -420,11 +463,39 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments) {
     };
   }
   if (normalizedTool === "view" && PATH_MISSING.test(failureDetails)) {
+    if (currentPath && isKnownSidequestPath(currentPath)) {
+      return {
+        category: "known-path-read-preflight",
+        path: currentPath,
+        reason: "The view call targeted a stale or unproven path under the .sd/sidequests workspace, so the path should be re-derived before reading.",
+        recovery: {
+          text: "Re-derive the correct path from the current session context and use discovery to verify it before retrying the read.",
+          steps: [
+            "Re-derive the canonical path from the current session context.",
+            "Use discovery to verify the path before retrying the read."
+          ]
+        }
+      };
+    }
+    if (currentPath && knownFileBackedPaths.includes(currentPath)) {
+      return {
+        category: "known-path-read-preflight",
+        path: currentPath,
+        reason: "The view call targeted a proven file-backed output path that should be read through atrium-read with a bounded range.",
+        recovery: {
+          text: "Use atrium-read with a bounded range request so the proven file-backed output path can be read safely.",
+          steps: [
+            "Use atrium-read to read the proven file-backed output path.",
+            "Request a bounded range with startLine, count, and endLine so the read stays bounded."
+          ]
+        }
+      };
+    }
     return {
       category: "missing-path",
       cause: "The view tool targeted a path that did not exist in the active filesystem context.",
       fix: "Verify the active worktree and exact path before reading. Prefer workspace paths over stale main-checkout paths.",
-      path: stringValue(args?.path)
+      path: currentPath
     };
   }
   if (normalizedTool === "create" && PARENT_DIRECTORY_MISSING.test(failureDetails)) {
