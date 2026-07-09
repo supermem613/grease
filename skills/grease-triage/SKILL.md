@@ -41,6 +41,8 @@ Only codify a new instruction when the cause is all three: deterministic, recurr
 
 For session-store timeout items, use any captured planning guidance in the item's local evidence when you brief a fix-it session or close the item. Treat that guidance as part of the recorded item context, not as a separate signal from outside Grease.
 
+For known-path read preflight items, use `failureDiagnosis.recovery` when you brief a fix-it session or close the item.
+
 ### Caller-side vs tool defect
 
 A tool that errors correctly on bad input (missing file, bad root, malformed arguments) is caller-side: fix the caller, usually an instruction. A tool that fails on valid input is a defect: fix or relay it. Do not relay caller-side errors.
