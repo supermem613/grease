@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
-import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -58,20 +58,15 @@ export async function rebuildCatalog(options = {}) {
 async function rebuildCatalogUnlocked(root) {
   await ensureStore(root);
   const events = await readEvents({ root });
-  const sourceEventLogBytes = await readSourceEventLogBytes(root);
-  const generationId = buildGenerationId(events, sourceEventLogBytes);
-  let generatedAt = new Date().toISOString();
-  try {
-    const existingCatalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
-    if (existingCatalog?.version === CATALOG_VERSION && existingCatalog?.generationId === generationId) {
-      generatedAt = existingCatalog.generatedAt;
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
-  }
-  const catalog = buildCatalog(events, { generatedAt, generationId, sourceEventLogBytes });
+  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
+  const generationId = buildGenerationId(events, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  const generatedAt = new Date().toISOString();
+  const catalog = buildCatalog(events, {
+    generatedAt,
+    generationId,
+    sourceEventLogBytes: sourceEventLogMetadata.size,
+    sourceEventLogMtimeMs: sourceEventLogMetadata.mtimeMs
+  });
   const active = buildActiveProjection(catalog);
   await writeJsonFilesAtomic(root, catalog, active);
   return catalog;
@@ -98,25 +93,162 @@ export async function readActiveCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
   await ensureStore(root);
   const activeFilePath = activePath(root);
-  try {
-    const active = JSON.parse(await readFile(activeFilePath, "utf8"));
-    const sourceEventLogBytes = await readSourceEventLogBytes(root);
-    if (active.version !== CATALOG_VERSION || active.sourceEventLogBytes !== sourceEventLogBytes) {
-      return rebuildActiveCatalog(root);
+  const initialValidation = await validateActiveProjection(root, activeFilePath);
+  if (initialValidation.valid) {
+    return initialValidation.projection;
+  }
+
+  return enqueueStoreWrite(root, async () => {
+    const lockedValidation = await validateActiveProjection(root, activeFilePath, { strict: true });
+    if (lockedValidation.valid) {
+      return lockedValidation.projection;
     }
-    return { ...active, path: activeFilePath };
+    if (lockedValidation.reason === "tail-parse" && lockedValidation.error instanceof SyntaxError) {
+      throw lockedValidation.error;
+    }
+    await rebuildCatalogUnlocked(root);
+    return readActiveProjectionFile(root, activeFilePath);
+  });
+}
+
+async function validateActiveProjection(root, activeFilePath, options = {}) {
+  const strict = options.strict ?? false;
+  let active;
+  try {
+    active = JSON.parse(await readFile(activeFilePath, "utf8"));
   } catch (error) {
-    if (error?.code === "ENOENT") {
-      return rebuildActiveCatalog(root);
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) {
+      return { valid: false, reason: error instanceof SyntaxError ? "active-json-syntax" : "missing-active" };
     }
     throw error;
   }
+
+  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
+  let expectedGenerationId;
+  try {
+    expectedGenerationId = await deriveGenerationId(root, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      if (strict) {
+        return { valid: false, reason: "tail-parse", error };
+      }
+      return { valid: false, reason: "tail-parse", error };
+    }
+    throw error;
+  }
+  if (active.version !== CATALOG_VERSION ||
+      active.sourceEventLogBytes !== sourceEventLogMetadata.size ||
+      active.sourceEventLogMtimeMs !== sourceEventLogMetadata.mtimeMs ||
+      active.generationId !== expectedGenerationId) {
+    return { valid: false, reason: "stale" };
+  }
+
+  return {
+    valid: true,
+    projection: { ...active, path: activeFilePath }
+  };
+}
+
+async function readActiveProjectionFile(root, activeFilePath) {
+  const projection = JSON.parse(await readFile(activeFilePath, "utf8"));
+  return { ...projection, path: activeFilePath };
+}
+
+async function deriveGenerationId(root, sourceEventLogBytes, sourceEventLogMtimeMs) {
+  const lastEvent = await readLastEvent(root);
+  return buildGenerationId(lastEvent ? [lastEvent] : [], sourceEventLogBytes, sourceEventLogMtimeMs);
+}
+
+async function readLastEvent(root) {
+  const eventLogPath = eventsPath(root);
+  let fileSize;
+  try {
+    fileSize = (await stat(eventLogPath)).size;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  if (fileSize === 0) {
+    return undefined;
+  }
+
+  const handle = await open(eventLogPath, "r");
+  try {
+    let buffer = Buffer.alloc(0);
+    let offset = fileSize;
+    let chunkSize = Math.min(4_096, fileSize);
+    while (offset > 0) {
+      const readSize = Math.min(chunkSize, offset);
+      const position = offset - readSize;
+      const readResult = await handle.read(Buffer.alloc(readSize), 0, readSize, position);
+      if (readResult.bytesRead === 0) {
+        break;
+      }
+      const chunk = Buffer.from(readResult.buffer.subarray(0, readResult.bytesRead));
+      buffer = Buffer.concat([chunk, buffer]);
+      offset = position;
+      const line = findLastNonEmptyLine(buffer, offset === 0);
+      if (line !== undefined) {
+        return JSON.parse(line);
+      }
+      if (offset === 0) {
+        break;
+      }
+      chunkSize = Math.min(chunkSize * 2, fileSize);
+    }
+    return undefined;
+  } finally {
+    await handle.close();
+  }
+}
+
+function findLastNonEmptyLine(buffer, reachedStart) {
+  let cursor = buffer.length;
+  while (cursor > 0) {
+    while (cursor > 0 && (buffer[cursor - 1] === 0x0a || buffer[cursor - 1] === 0x0d)) {
+      cursor -= 1;
+    }
+    if (cursor === 0) {
+      return undefined;
+    }
+    const newlineIndex = buffer.lastIndexOf(0x0a, cursor - 1);
+    if (newlineIndex === -1) {
+      if (!reachedStart) {
+        return undefined;
+      }
+      const candidate = buffer.subarray(0, cursor).toString("utf8");
+      return candidate.trim() === "" ? undefined : candidate;
+    }
+    const candidate = buffer.subarray(newlineIndex + 1, cursor).toString("utf8");
+    if (candidate.trim() !== "") {
+      return candidate;
+    }
+    cursor = newlineIndex;
+  }
+  return undefined;
+}
+
+export async function readCatalogSummary(options = {}) {
+  const root = options.root ?? defaultStoreRoot();
+  const active = await readActiveCatalog({ ...options, root });
+  const total = Object.values(active.statusCounts ?? {}).reduce((sum, value) => sum + Number(value ?? 0), 0);
+  return {
+    counts: {
+      total,
+      open: active.statusCounts?.open ?? 0
+    },
+    paths: pathsForStore(root)
+  };
 }
 
 export async function searchCatalog(query = {}, options = {}) {
-  const catalog = await readCatalog(options);
-  const text = String(query.query ?? "").toLowerCase();
   const status = query.status ? String(query.status) : undefined;
+  const catalog = status && ["open", "triaged", "in-progress"].includes(status)
+    ? await readActiveCatalog(options)
+    : await readCatalog(options);
+  const text = String(query.query ?? "").toLowerCase();
   const limit = Number.isInteger(query.limit) ? query.limit : 25;
   const items = catalog.items
     .filter((item) => !status || item.status === status)
@@ -147,6 +279,12 @@ export async function searchCatalog(query = {}, options = {}) {
 }
 
 export async function getFriction(id, options = {}) {
+  const activeCatalog = await readActiveCatalog(options);
+  const activeItem = activeCatalog.items.find((candidate) => candidate.id === id);
+  if (activeItem) {
+    const occurrences = activeCatalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
+    return { item: activeItem, occurrences };
+  }
   const catalog = await readCatalog(options);
   const item = catalog.items.find((candidate) => candidate.id === id);
   if (!item) {
@@ -201,8 +339,9 @@ export function buildCatalog(events, options = {}) {
   const occurrences = [];
   const updates = [];
   const generatedAt = options.generatedAt ?? new Date().toISOString();
-  const generationId = options.generationId ?? buildGenerationId(events, options.sourceEventLogBytes ?? 0);
+  const generationId = options.generationId ?? buildGenerationId(events, options.sourceEventLogBytes ?? 0, options.sourceEventLogMtimeMs ?? 0);
   const sourceEventLogBytes = options.sourceEventLogBytes ?? 0;
+  const sourceEventLogMtimeMs = options.sourceEventLogMtimeMs ?? 0;
 
   for (const event of events) {
     if (event.type === "friction.signal") {
@@ -288,6 +427,7 @@ export function buildCatalog(events, options = {}) {
     generatedAt,
     generationId,
     sourceEventLogBytes,
+    sourceEventLogMtimeMs,
     items: [...items.values()].sort(sortItems),
     occurrences: occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)))
   };
@@ -297,8 +437,7 @@ export function pathsForStore(root = defaultStoreRoot()) {
   return {
     root,
     events: eventsPath(root),
-    catalog: catalogPath(root),
-    active: activePath(root)
+    catalog: catalogPath(root)
   };
 }
 
@@ -464,15 +603,14 @@ async function waitForRetry() {
   await scheduler.wait(25);
 }
 
-function buildGenerationId(events, sourceEventLogBytes) {
+function buildGenerationId(events, sourceEventLogBytes, sourceEventLogMtimeMs) {
   const lastEvent = events.length > 0 ? events[events.length - 1] : undefined;
+  const lastEventSnapshot = lastEvent === undefined ? "" : JSON.stringify(lastEvent);
   return hash([
     String(CATALOG_VERSION),
     String(sourceEventLogBytes),
-    String(events.length),
-    String(lastEvent?.id ?? ""),
-    String(lastEvent?.at ?? ""),
-    String(lastEvent?.type ?? "")
+    String(sourceEventLogMtimeMs ?? 0),
+    lastEventSnapshot
   ]);
 }
 
@@ -496,6 +634,7 @@ function buildActiveProjection(catalog) {
     generatedAt: catalog.generatedAt,
     generationId: catalog.generationId,
     sourceEventLogBytes: catalog.sourceEventLogBytes,
+    sourceEventLogMtimeMs: catalog.sourceEventLogMtimeMs,
     items: items.map((item) => ({ ...item })),
     occurrences,
     statusCounts
@@ -509,12 +648,13 @@ async function rebuildActiveCatalog(root) {
   return { ...projection, path: activeFilePath };
 }
 
-async function readSourceEventLogBytes(root) {
+async function readSourceEventLogMetadata(root) {
   try {
-    return (await stat(eventsPath(root))).size;
+    const info = await stat(eventsPath(root));
+    return { size: info.size, mtimeMs: info.mtimeMs };
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return 0;
+      return { size: 0, mtimeMs: 0 };
     }
     throw error;
   }

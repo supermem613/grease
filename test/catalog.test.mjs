@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -171,10 +171,10 @@ test("active projection contains only actionable items and shares generation met
     const paths = pathsForStore(root);
     const catalog = await readCatalog({ root });
 
-    assert.equal(paths.active, path.join(root, "active.json"));
     assert.equal(typeof catalogStore.readActiveCatalog, "function");
 
     const activeProjection = await catalogStore.readActiveCatalog({ root });
+    assert.equal(activeProjection.path, path.join(root, "active.json"));
     assert.deepEqual(activeProjection.items.map((item) => item.id).sort(), [openId, triagedId, inProgressId].sort());
     assert.equal(activeProjection.occurrences.length, 4);
     assert.equal(activeProjection.occurrences.filter((occurrence) => occurrence.frictionId === openId).length, 2);
@@ -218,17 +218,206 @@ test("missing or stale active projection rebuilds from events", async () => {
     const afterDelete = await catalogStore.readActiveCatalog({ root });
     assert.deepEqual(afterDelete.items.map((item) => item.id).sort(), [openId, triagedId, inProgressId].sort());
 
-    await writeFile(initialActive.path, JSON.stringify({
+    const staleActiveProjection = {
       ...afterDelete,
-      version: afterDelete.version + 1,
-      sourceEventLogBytes: afterDelete.sourceEventLogBytes + 1
-    }, null, 2));
+      generatedAt: "stale-generated-at",
+      generationId: "stale-generation-id",
+      items: [{ id: "wrong-item", status: "open" }],
+      occurrences: [],
+      statusCounts: {
+        open: 1,
+        triaged: 0,
+        "in-progress": 0,
+        resolved: 0,
+        ignored: 0
+      }
+    };
+    await writeFile(initialActive.path, JSON.stringify(staleActiveProjection, null, 2));
 
     const afterStaleWrite = await catalogStore.readActiveCatalog({ root });
+    const catalog = await readCatalog({ root });
     assert.deepEqual(afterStaleWrite.items.map((item) => item.id).sort(), [openId, triagedId, inProgressId].sort());
-    assert.equal(afterStaleWrite.version, afterDelete.version);
-    assert.equal(afterStaleWrite.generatedAt, afterDelete.generatedAt);
+    assert.equal(afterStaleWrite.version, catalog.version);
+    assert.equal(afterStaleWrite.generatedAt, catalog.generatedAt);
     assert.equal(afterStaleWrite.sourceEventLogBytes, (await stat(paths.events)).size);
+    assert.notEqual(afterStaleWrite.generationId, staleActiveProjection.generationId);
+    assert.equal(afterStaleWrite.generationId, catalog.generationId);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("same-size event log rewrite rebuilds active projection with updated metadata", async () => {
+  const root = await tempRoot();
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "same-size-rewrite",
+      error: "Original signal content"
+    }, {
+      sessionId: "session-rewrite",
+      sessionName: "Rewrite Session",
+      workingDirectory: "C:\\repo"
+    });
+    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const initialActive = await catalogStore.readActiveCatalog({ root });
+    const paths = pathsForStore(root);
+    const originalLine = (await readFile(paths.events, "utf8")).trim();
+    const originalEvent = JSON.parse(originalLine);
+    const originalTitle = String(originalEvent.signal?.title ?? "");
+    const originalSummary = String(originalEvent.signal?.summary ?? "");
+    const replacementTitle = `fresh-${"x".repeat(Math.max(0, originalTitle.length - 5))}`.slice(0, originalTitle.length);
+    const replacementSummary = `fresh-${"x".repeat(Math.max(0, originalSummary.length - 5))}`.slice(0, originalSummary.length);
+    const replacementLine = JSON.stringify({
+      ...originalEvent,
+      signal: {
+        ...originalEvent.signal,
+        title: replacementTitle,
+        summary: replacementSummary
+      }
+    });
+
+    assert.equal(Buffer.byteLength(replacementLine, "utf8"), Buffer.byteLength(originalLine, "utf8"));
+    await writeFile(paths.events, `${replacementLine}\n`, "utf8");
+    await utimes(paths.events, new Date("2026-06-10T00:00:00.000Z"), new Date("2026-06-10T00:00:00.000Z"));
+
+    const rebuiltActive = await catalogStore.readActiveCatalog({ root });
+    const currentStats = await stat(paths.events);
+
+    assert.equal(rebuiltActive.items[0].title, replacementTitle);
+    assert.equal(rebuiltActive.items[0].latestSummary, replacementSummary);
+    assert.notEqual(rebuiltActive.generationId, initialActive.generationId);
+    assert.equal(rebuiltActive.sourceEventLogBytes, currentStats.size);
+    assert.equal(rebuiltActive.sourceEventLogMtimeMs, currentStats.mtimeMs);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent stale active reads reuse the first rebuild", async () => {
+  const root = await tempRoot();
+  try {
+    await seedActiveProjectionItems(root);
+    const paths = pathsForStore(root);
+    const activePath = path.join(root, "active.json");
+    await rm(activePath, { force: true });
+
+    const results = await Promise.all(Array.from({ length: 4 }, () => catalogStore.readActiveCatalog({ root })));
+    assert.equal(results.length, 4);
+    const expectedItems = results[0].items.map((item) => item.id).sort();
+    const currentStats = await stat(paths.events);
+    for (const result of results) {
+      assert.deepEqual(result.items.map((item) => item.id).sort(), expectedItems);
+      assert.equal(result.generationId, results[0].generationId);
+      assert.equal(result.generatedAt, results[0].generatedAt);
+      assert.equal(result.sourceEventLogBytes, currentStats.size);
+      assert.equal(result.sourceEventLogMtimeMs, currentStats.mtimeMs);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("transient tail parse errors wait for a locked repair before returning the projection", async () => {
+  const root = await tempRoot();
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "transient-tail",
+      error: "Tail parse repair"
+    }, {
+      sessionId: "session-tail",
+      sessionName: "Tail Session",
+      workingDirectory: "C:\\repo"
+    });
+
+    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await catalogStore.readActiveCatalog({ root });
+
+    const paths = pathsForStore(root);
+    const incompleteTail = '{"type":"friction.signal","id":"transient-tail","at":"2026-06-09T12:00:01.000Z","machineName":"devbox-1","signal":{"kind":"tool","source":"test","title":"pending","summary":"before repair"';
+    await writeFile(paths.events, `${incompleteTail}\n`, "utf8");
+
+    const lockPath = path.join(root, "catalog.lock");
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: process.pid, id: "lock-fixture", acquiredAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
+
+    const readPromise = catalogStore.readActiveCatalog({ root });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const completedTail = JSON.stringify({
+      ...signal,
+      id: "transient-tail",
+      at: "2026-06-09T12:00:01.000Z",
+      machineName: "devbox-1",
+      signal: {
+        ...signal.signal,
+        title: "repaired",
+        summary: "after repair"
+      }
+    });
+    await writeFile(paths.events, `${completedTail}\n`, "utf8");
+    await rm(lockPath, { recursive: true, force: true });
+
+    const repairedProjection = await readPromise;
+    const catalog = await readCatalog({ root });
+    assert.equal(repairedProjection.items.some((item) => item.title === "repaired"), true);
+    assert.equal(repairedProjection.generationId, catalog.generationId);
+    assert.equal(repairedProjection.sourceEventLogBytes, (await stat(paths.events)).size);
+    assert.equal(repairedProjection.sourceEventLogMtimeMs, (await stat(paths.events)).mtimeMs);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("active status searches use the active projection without changing all-status semantics", async () => {
+  const root = await tempRoot();
+  try {
+    const { openId, resolvedId } = await seedActiveProjectionItems(root);
+    const paths = pathsForStore(root);
+    const validCatalogText = await readFile(paths.catalog, "utf8");
+
+    await writeFile(paths.catalog, "{invalid json", "utf8");
+
+    const activeSearch = await searchCatalog({ query: "active-open", status: "open" }, { root });
+    assert.equal(activeSearch.items.length, 1);
+    assert.equal(activeSearch.items[0].id, openId);
+
+    const activeGet = await catalogStore.getFriction(openId, { root });
+    assert.equal(activeGet.item.id, openId);
+    assert.equal(activeGet.item.status, "open");
+    assert.equal(activeGet.occurrences.length, 2);
+
+    await writeFile(paths.catalog, validCatalogText, "utf8");
+
+    const noStatusSearch = await searchCatalog({ query: "active-" }, { root });
+    assert.ok(noStatusSearch.items.some((item) => item.id === openId));
+    assert.ok(noStatusSearch.items.some((item) => item.id === resolvedId));
+
+    const resolvedSearch = await searchCatalog({ query: "active-resolved", status: "resolved" }, { root });
+    assert.equal(resolvedSearch.items.length, 1);
+    assert.equal(resolvedSearch.items[0].id, resolvedId);
+
+    const resolvedGet = await catalogStore.getFriction(resolvedId, { root });
+    assert.equal(resolvedGet.item.id, resolvedId);
+    assert.equal(resolvedGet.occurrences.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog summary preserves status output without loading the full catalog", async () => {
+  const root = await tempRoot();
+  try {
+    await seedActiveProjectionItems(root);
+    const paths = pathsForStore(root);
+
+    await writeFile(paths.catalog, "{invalid json", "utf8");
+
+    const summary = await catalogStore.readCatalogSummary({ root });
+    assert.deepEqual(summary.counts, { total: 5, open: 1 });
+    assert.deepEqual(summary.paths, pathsForStore(root));
   } finally {
     await rm(root, { recursive: true, force: true });
   }

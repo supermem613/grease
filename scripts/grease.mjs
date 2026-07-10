@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction, updateFrictionBulk } from "../.github/extensions/grease/core/catalog.mjs";
+import { getFriction, pathsForStore, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "../.github/extensions/grease/core/catalog.mjs";
 import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
 
 const VERSION = "0.1.0";
@@ -47,14 +47,7 @@ async function dispatch(name, argv) {
     };
   }
   if (name === "status") {
-    const catalog = await readCatalog();
-    return ok("status", {
-      counts: {
-        total: catalog.items.length,
-        open: catalog.items.filter((item) => item.status === "open").length
-      },
-      paths: pathsForStore()
-    });
+    return ok("status", await readCatalogSummary());
   }
   if (name === "search") {
     const result = await searchCatalog({
