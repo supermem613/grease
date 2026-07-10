@@ -2,6 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
+function recoveryText(diagnosis) {
+  if (typeof diagnosis.recovery === "string") {
+    return diagnosis.recovery;
+  }
+  const candidates = [];
+  if (diagnosis.recovery?.text) {
+    candidates.push(diagnosis.recovery.text);
+  }
+  if (Array.isArray(diagnosis.recovery?.steps)) {
+    candidates.push(...diagnosis.recovery.steps);
+  }
+  return candidates.join("\n");
+}
+
 test("classifies local tool access denied as high severity friction", () => {
   const [signal] = classifySessionEvent("tool.execution_complete", {
     success: false,
@@ -206,9 +220,28 @@ test("diagnoses exact edit misses", () => {
     }
   });
 
-  assert.equal(signal.signal.evidence.failureDiagnosis.category, "exact-edit-miss");
+  assert.equal(signal.signal.evidence.failureDiagnosis.category, "stale-preimage-editing");
   assert.equal(signal.signal.evidence.failureDiagnosis.oldStringLength, 13);
-  assert.match(signal.signal.evidence.failureDiagnosis.fix, /Read the current target region/);
+  assert.match(recoveryText(signal.signal.evidence.failureDiagnosis), /current target region/);
+});
+
+test("diagnoses stale edit preimages with fresh-read recovery", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "edit",
+    error: { message: "No match found", code: "failure" },
+    arguments: {
+      path: "C:\\Users\\marcusm\\repos\\grease\\.github\\extensions\\grease\\core\\classifier.mjs",
+      old_str: "stale content",
+      new_str: "new content"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "stale-preimage-editing");
+  assert.equal(diagnosis.path, "C:\\Users\\marcusm\\repos\\grease\\.github\\extensions\\grease\\core\\classifier.mjs");
+  assert.match(diagnosis.reason, /stale|preimage/i);
+  assert.match(recoveryText(diagnosis), /fresh read|current target|reread/i);
 });
 
 test("diagnoses missing view paths", () => {
@@ -318,8 +351,25 @@ test("diagnoses stale apply_patch context", () => {
     arguments: "*** Begin Patch\n*** Update File: C:\\Users\\marcusm\\repos\\winch\\src\\Winch.Adapters.Web\\Substrate\\Cdp\\CdpSubstrate.cs\n@@\n"
   });
 
-  assert.equal(signal.signal.evidence.failureDiagnosis.category, "stale-patch-context");
+  assert.equal(signal.signal.evidence.failureDiagnosis.category, "stale-preimage-editing");
   assert.equal(signal.signal.evidence.failureDiagnosis.targetPath, "C:\\Users\\marcusm\\repos\\winch\\src\\Winch.Adapters.Web\\Substrate\\Cdp\\CdpSubstrate.cs");
+});
+
+test("diagnoses stale apply_patch preimages with hunk rebuild recovery", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "apply_patch",
+    error: {
+      message: "Error: Failed to find expected lines in C:\\Users\\marcusm\\repos\\winch\\src\\Winch.Adapters.Web\\Substrate\\SubstrateTypes.cs:\ninternal sealed record DomResolution(",
+      code: "failure"
+    },
+    arguments: "*** Begin Patch\n*** Update File: C:\\Users\\marcusm\\repos\\winch\\src\\Winch.Adapters.Web\\Substrate\\Cdp\\CdpSubstrate.cs\n@@\n"
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "stale-preimage-editing");
+  assert.equal(diagnosis.targetPath, "C:\\Users\\marcusm\\repos\\winch\\src\\Winch.Adapters.Web\\Substrate\\Cdp\\CdpSubstrate.cs");
+  assert.match(recoveryText(diagnosis), /fresh read|rebuild|hunk/i);
 });
 
 test("diagnoses unavailable repository-scoped memory", () => {
