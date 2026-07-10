@@ -11,6 +11,7 @@ const STORE_LOCK_TIMEOUT_MS = 10_000;
 const STORE_LOCK_STALE_MS = 30_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
 const storeWriteQueues = new Map();
+const disabledActiveProjectionRoots = new Set();
 let atomicWriteId = 0;
 
 export function defaultStoreRoot() {
@@ -91,15 +92,38 @@ export async function readCatalog(options = {}) {
 
 export async function readActiveCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
+  const normalizedRoot = path.resolve(root);
   await ensureStore(root);
   const activeFilePath = activePath(root);
-  const initialValidation = await validateActiveProjection(root, activeFilePath);
+  if (disabledActiveProjectionRoots.has(normalizedRoot)) {
+    return readActiveCatalogFallback(root, activeFilePath);
+  }
+
+  let initialValidation;
+  try {
+    initialValidation = await validateActiveProjection(root, activeFilePath);
+  } catch (error) {
+    if (isActiveProjectionReadFailure(error)) {
+      markActiveProjectionDisabled(normalizedRoot, error);
+      return readActiveCatalogFallback(root, activeFilePath);
+    }
+    throw error;
+  }
   if (initialValidation.valid) {
     return initialValidation.projection;
   }
 
   return enqueueStoreWrite(root, async () => {
-    const lockedValidation = await validateActiveProjection(root, activeFilePath, { strict: true });
+    let lockedValidation;
+    try {
+      lockedValidation = await validateActiveProjection(root, activeFilePath, { strict: true });
+    } catch (error) {
+      if (isActiveProjectionReadFailure(error)) {
+        markActiveProjectionDisabled(normalizedRoot, error);
+        return readActiveCatalogFallback(root, activeFilePath);
+      }
+      throw error;
+    }
     if (lockedValidation.valid) {
       return lockedValidation.projection;
     }
@@ -107,7 +131,18 @@ export async function readActiveCatalog(options = {}) {
       throw lockedValidation.error;
     }
     await rebuildCatalogUnlocked(root);
-    return readActiveProjectionFile(root, activeFilePath);
+    if (disabledActiveProjectionRoots.has(normalizedRoot)) {
+      return readActiveCatalogFallback(root, activeFilePath);
+    }
+    try {
+      return await readActiveProjectionFile(root, activeFilePath);
+    } catch (error) {
+      if (isActiveProjectionReadFailure(error)) {
+        markActiveProjectionDisabled(normalizedRoot, error);
+        return readActiveCatalogFallback(root, activeFilePath);
+      }
+      throw error;
+    }
   });
 }
 
@@ -500,20 +535,52 @@ function storeLockPath(root) {
 }
 
 async function writeJsonFilesAtomic(root, catalog, active) {
+  const resolvedRoot = path.resolve(root);
   const catalogTempPath = `${catalogPath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
-  const activeTempPath = `${activePath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
+  let activeTempPath;
   try {
-    await Promise.all([
-      writeFile(catalogTempPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8"),
-      writeFile(activeTempPath, `${JSON.stringify(active)}\n`, "utf8")
-    ]);
+    await writeFile(catalogTempPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8");
     await replaceFileWithRetry(catalogTempPath, catalogPath(root));
-    await replaceFileWithRetry(activeTempPath, activePath(root));
+
+    activeTempPath = `${activePath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
+    try {
+      await writeFile(activeTempPath, `${JSON.stringify(active, null, 2)}\n`, "utf8");
+      await replaceFileWithRetry(activeTempPath, activePath(root));
+      disabledActiveProjectionRoots.delete(resolvedRoot);
+    } catch (error) {
+      if (activeTempPath) {
+        await rm(activeTempPath, { force: true }).catch(() => undefined);
+      }
+      markActiveProjectionDisabled(resolvedRoot, error);
+    }
   } catch (error) {
     await rm(catalogTempPath, { force: true }).catch(() => undefined);
-    await rm(activeTempPath, { force: true }).catch(() => undefined);
+    if (activeTempPath) {
+      await rm(activeTempPath, { force: true }).catch(() => undefined);
+    }
     throw error;
   }
+}
+
+function markActiveProjectionDisabled(root, error) {
+  const normalizedRoot = path.resolve(root);
+  if (disabledActiveProjectionRoots.has(normalizedRoot)) {
+    return false;
+  }
+  disabledActiveProjectionRoots.add(normalizedRoot);
+  process.emitWarning("active projection persistence failure; falling back to full catalog", {
+    code: "GREASE_ACTIVE_PROJECTION"
+  });
+  return true;
+}
+
+function isActiveProjectionReadFailure(error) {
+  return error?.code === "ENOENT" || error?.code === "EISDIR" || error?.code === "EACCES" || error?.code === "EPERM" || error?.code === "EBUSY";
+}
+
+async function readActiveCatalogFallback(root, activeFilePath) {
+  const catalog = await readCatalog({ root });
+  return { ...buildActiveProjection(catalog), path: activeFilePath };
 }
 
 function enqueueStoreWrite(root, operation) {

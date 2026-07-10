@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -367,6 +367,117 @@ test("transient tail parse errors wait for a locked repair before returning the 
     assert.equal(repairedProjection.sourceEventLogBytes, (await stat(paths.events)).size);
     assert.equal(repairedProjection.sourceEventLogMtimeMs, (await stat(paths.events)).mtimeMs);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("active projection write failure preserves durable capture and falls back to full catalog", async () => {
+  const root = await tempRoot();
+  try {
+    await mkdir(path.join(root, "active.json"), { recursive: true });
+
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "active-projection-write-failure",
+      error: "sensitive payload: top-secret-token"
+    }, {
+      sessionId: "session-projection-failure",
+      sessionName: "Projection Failure Session",
+      workingDirectory: "C:\\repo"
+    });
+
+    const warningPromise = new Promise((resolve) => process.once("warning", (warning) => resolve(warning)));
+
+    const appendResult = await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
+    const warning = await warningPromise;
+
+    assert.equal(appendResult.event.signal.title, signal.signal.title);
+    assert.equal((await readEvents({ root })).length, 1);
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1);
+    assert.equal(catalog.items[0].title, signal.signal.title);
+    assert.equal(catalog.items[0].latestSummary, signal.signal.summary);
+
+    assert.equal(warning.code, "GREASE_ACTIVE_PROJECTION");
+    assert.match(warning.message, /active projection persistence failure/i);
+    assert.equal(warning.message.includes("sensitive payload: top-secret-token"), false);
+
+    const fallbackSearch = await searchCatalog({ query: signal.signal.title, status: "open" }, { root });
+    assert.equal(fallbackSearch.items.length, 1);
+    assert.equal(fallbackSearch.items[0].id, catalog.items[0].id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("read-triggered active rebuild failure returns full-catalog fallback", { skip: process.platform !== "win32" }, async () => {
+  const root = await tempRoot();
+  let activeHandle;
+  try {
+    const [firstSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "read-triggered-first",
+      error: "first capture"
+    }, {
+      sessionId: "session-first",
+      sessionName: "First Session",
+      workingDirectory: "C:\\repo"
+    });
+    const [secondSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "read-triggered-second",
+      error: "second capture"
+    }, {
+      sessionId: "session-second",
+      sessionName: "Second Session",
+      workingDirectory: "C:\\repo"
+    });
+
+    await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
+
+    const paths = pathsForStore(root);
+    const initialProjection = await catalogStore.readActiveCatalog({ root });
+    assert.equal(initialProjection.items.length, 1);
+
+    const secondEvent = {
+      type: "friction.signal",
+      id: "second-event",
+      at: "2026-06-09T12:00:30.000Z",
+      machineName: "devbox-2",
+      sessionId: "session-second",
+      sessionName: "Second Session",
+      workingDirectory: "C:\\repo",
+      signal: {
+        kind: "tool",
+        source: "test",
+        title: secondSignal.signal.title,
+        summary: secondSignal.signal.summary
+      }
+    };
+    const existingEvents = await readFile(paths.events, "utf8");
+    await writeFile(paths.events, `${existingEvents}${JSON.stringify(secondEvent)}\n`, "utf8");
+
+    const warningPromise = new Promise((resolve) => process.once("warning", (warning) => resolve(warning)));
+    activeHandle = await open(path.join(root, "active.json"), "r");
+
+    const projection = await catalogStore.readActiveCatalog({ root });
+    const warning = await warningPromise;
+    const catalog = await readCatalog({ root });
+    const events = await readEvents({ root });
+
+    assert.equal(projection.items.length, 2);
+    assert.deepEqual(projection.items.map((item) => item.title).sort(), [firstSignal.signal.title, secondSignal.signal.title].sort());
+    assert.equal(projection.generationId, catalog.generationId);
+    assert.equal(projection.generatedAt, catalog.generatedAt);
+    assert.equal(projection.sourceEventLogBytes, (await stat(paths.events)).size);
+    assert.equal(warning.code, "GREASE_ACTIVE_PROJECTION");
+    assert.match(warning.message, /active projection persistence failure/i);
+    assert.equal(events.length, 2);
+  } finally {
+    if (activeHandle) {
+      await activeHandle.close();
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
