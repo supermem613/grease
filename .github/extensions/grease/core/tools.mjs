@@ -1,4 +1,4 @@
-import { appendEvent, getFriction, pathsForStore, readCatalog, searchCatalog, updateFriction, updateFrictionBulk } from "./catalog.mjs";
+import { appendEvent, getFriction, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "./catalog.mjs";
 import { buildBrief } from "./brief.mjs";
 import { classifyManualCapture } from "./classifier.mjs";
 
@@ -12,15 +12,8 @@ export function createGreaseTools(options = {}) {
         properties: {}
       },
       handler: async () => {
-        const catalog = await readCatalog(options);
-        const open = catalog.items.filter((item) => item.status === "open").length;
-        return success("grease_status", {
-          counts: {
-            total: catalog.items.length,
-            open
-          },
-          paths: pathsForStore(options.root)
-        });
+        const summary = await readCatalogSummary(options);
+        return success("grease_status", summary);
       }
     },
     {
