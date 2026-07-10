@@ -16,7 +16,7 @@ Concretely:
 
 - Zero runtime dependencies. The only import from outside the repo is `@github/copilot-sdk`, which is host-injected by Copilot when the extension runs.
 - No HTTP client, no `fetch`, no socket connections, no servers of any kind. Grease is a headless capture-and-catalog tool with no network code.
-- Captured payloads can include tool names, error messages, working directories, and user message snippets from your own Copilot sessions. They are written to `~/.grease/events.jsonl` and compacted into `~/.grease/catalog.json` on disk. You can delete those files at any time to reset Grease.
+- Captured payloads can include tool names, error messages, working directories, and user message snippets from your own Copilot sessions. They are written to `~/.grease/events.jsonl`, retained in `~/.grease/catalog.json`, and projected into `~/.grease/active.json` on disk. You can delete those files at any time to reset Grease.
 - `grease_brief` produces a prompt in your shell; nothing is sent anywhere on your behalf. If you choose to paste a brief into another Copilot session, that is the only path off the machine, and you control it.
 
 ## How it loads
@@ -44,10 +44,11 @@ Grease stores data under `~\.grease` by default:
 ```text
 ~\.grease\
   events.jsonl      # append-only source of truth
-  catalog.json      # compacted derived catalog
+  catalog.json      # full historical projection
+  active.json       # disposable actionable working-set projection
 ```
 
-The append-only log is the durable source of truth. `catalog.json` is regenerated from the log and written with a temporary file plus atomic rename.
+`events.jsonl` is the append-only source of truth. `catalog.json` is the retained full historical projection, including resolved and ignored items. `active.json` is the disposable actionable working-set projection used by active-status searches and status summaries. If `active.json` is missing, stale, incompatible, or interrupted, it is rebuilt from `events.jsonl` under the store lock. Resolved and ignored items remain queryable through the full catalog, and no-status search behavior is unchanged. Active status searches and status summaries use `active.json`, but CLI and tool output schemas stay the same.
 
 ## Agent tools
 
