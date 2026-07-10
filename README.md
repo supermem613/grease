@@ -119,6 +119,7 @@ No runtime dependencies are required. `@github/copilot-sdk` is host-injected by 
 - Capture and interpretation are separate. Events are logged first; catalog compaction groups them into durable items.
 - Session-store timeout captures can include deterministic query-shape planning guidance as local catalog context, so the same friction can be briefed and closed with a repeatable plan.
 - Grease enriches captured view `Path does not exist` failures for known-path read preflight when paths are stale/unproven or proven file-backed Atrium outputs, with discovery-first or `atrium-read` bounded-range recovery guidance.
+- Grease enriches captured stale preimage editing failures from `edit` and `apply_patch` with fresh-read and hunk-rebuild recovery guidance after the failed call is captured.
 - Grease does not create sessions directly. `grease_brief` produces the kickoff prompt that a session creation flow can use.
 
 ## License

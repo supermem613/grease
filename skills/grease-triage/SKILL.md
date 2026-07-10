@@ -56,6 +56,8 @@ For session-store timeout items, use any captured planning guidance in the item'
 
 For known-path read preflight items, use `failureDiagnosis.recovery` when you brief a fix-it session or close the item.
 
+For stale preimage editing items, use `failureDiagnosis.recovery` when briefing edit or `apply_patch` fixes, and do not describe Grease as preventing the failed call before capture.
+
 ### Caller-side vs tool defect
 
 A tool that errors correctly on bad input (missing file, bad root, malformed arguments) is caller-side: fix the caller, usually an instruction. A tool that fails on valid input is a defect: fix or relay it. Do not relay caller-side errors.

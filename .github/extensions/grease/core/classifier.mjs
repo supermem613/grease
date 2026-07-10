@@ -428,6 +428,19 @@ function collectFileBackedPaths(...sources) {
   return paths;
 }
 
+function stalePreimageRecovery(policyDenied, recovery) {
+  if (policyDenied) {
+    return {
+      text: "Stop on the policy denial. Do not work around the protected path or retry with alternate access.",
+      steps: [
+        "Surface the policy denial to the user.",
+        "Do not rebuild or retry the edit against protected content."
+      ]
+    };
+  }
+  return recovery;
+}
+
 function isKnownSidequestPath(value) {
   const text = stringValue(value);
   return Boolean(text && /(?:^|[\\/])\.sd[\\/]+sidequests[\\/]/i.test(text));
@@ -455,9 +468,16 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
   }
   if (normalizedTool === "edit" && EXACT_EDIT_MISS.test(failureDetails)) {
     return {
-      category: "exact-edit-miss",
-      cause: "The edit tool was asked to replace an exact old_str that no longer matched the file content.",
-      fix: "Read the current target region, then retry with a smaller current old_str or use apply_patch with fresh context.",
+      category: "stale-preimage-editing",
+      path: currentPath,
+      reason: "The edit tool was asked to replace stale preimage text that no longer matched the current file content.",
+      recovery: stalePreimageRecovery(POLICY.test(failureDetails), {
+        text: "Take a fresh read of the current target region, then retry with old_str rebuilt from the current file contents.",
+        steps: [
+          "Read the current target region with the approved file-read tool.",
+          "Rebuild old_str from the current file contents before retrying the edit."
+        ]
+      }),
       oldStringLength: stringLength(args?.old_str),
       newStringLength: stringLength(args?.new_str)
     };
@@ -509,9 +529,15 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
   }
   if (normalizedTool === "apply_patch" && PATCH_CONTEXT_MISSING.test(failureDetails)) {
     return {
-      category: "stale-patch-context",
-      cause: "The patch expected lines that were not present in the target file, usually because the file changed or the patch context was copied from a different revision.",
-      fix: "Read the current target section and regenerate the patch with exact current context.",
+      category: "stale-preimage-editing",
+      reason: "The apply_patch hunk used stale preimage context that was not present in the current target file.",
+      recovery: stalePreimageRecovery(POLICY.test(failureDetails), {
+        text: "Take a fresh read of the current target section, then rebuild the apply_patch hunk from current text.",
+        steps: [
+          "Read the current target section with the approved file-read tool.",
+          "Rebuild the patch hunk from the current text before retrying apply_patch."
+        ]
+      }),
       targetPath: patchTargetPath(rawArguments)
     };
   }
