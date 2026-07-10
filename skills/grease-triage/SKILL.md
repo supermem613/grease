@@ -21,6 +21,19 @@ There is no UI. The entire loop runs through the six Grease agent tools (or the 
 5. **Capture (as needed)** — Use `grease_capture` to manually record friction the passive event stream cannot see.
 6. **Close** — After a fix is validated, use `grease_update` to change status, severity, tags, or a note.
 
+## Capture discipline
+
+Capture operational friction when you encounter it, without waiting for the user to request it. This includes confusing instructions, missing context, repeated manual steps, avoidable retries, workarounds, permission barriers, and tools that are difficult to use. Capture friction even when you recover and finish the task. Do not manually duplicate an exact tool failure Grease already captured through the passive event stream.
+
+Every manual item should include:
+
+- A concise symptom-focused title, not the name of the task.
+- A summary covering the attempted action, expected result, actual result, impact, and any workaround or extra steps.
+- A reusable kind and source identifying the failure class and the tool, workflow, instruction set, service, or environment involved.
+- Severity based on impact: low for a minor delay, medium for meaningful extra work, high for blocked or repeatedly derailed work, and critical for data, security, or broad availability risk.
+- Working directory, session name, and short tags when known.
+- Redacted evidence sufficient to reproduce or investigate the friction, including relevant arguments, error text, output, and exact steps. Never record credentials, tokens, personal data, or other secrets.
+
 ## Triage discipline
 
 The loop is mechanical; triage is judgment. These rules keep triage purposeful and stop the catalog from turning into instruction bloat.

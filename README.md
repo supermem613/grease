@@ -56,7 +56,7 @@ The extension registers these six tools:
 | Tool | Purpose |
 | --- | --- |
 | `grease_status` | Show catalog health and paths. |
-| `grease_capture` | Manually capture a friction item. |
+| `grease_capture` | Capture model-observed operational friction that passive telemetry may not see. |
 | `grease_search` | Search catalog items. |
 | `grease_get` | Inspect one item with evidence. |
 | `grease_update` | Change status, severity, tags, or note on one item (`id`) or many items at once (`ids`). |
@@ -80,6 +80,8 @@ Non-interactive commands write JSON only to stdout. The `schema` command is the 
 ## Triage skill
 
 The `grease-triage` skill drives the headless triage loop end to end: capture, status, search or get, brief, then update items individually or in bulk. See `skills/grease-triage/SKILL.md`.
+
+The `grease_capture` MCP tool is the primary agent instruction surface because its description and parameter guidance are visible whenever the extension is loaded. It tells agents to record operational friction during the task without waiting for a user request, and specifies the minimum context and redacted evidence each item should carry. The triage skill repeats the policy for operators reviewing the catalog.
 
 Skills and extensions are separate Copilot subsystems: the extension registers tools and hooks, while skills are discovered from the skills directories. `npm run setup` installs both from a single command (see below), so the skills activate alongside the tools.
 
