@@ -5,6 +5,28 @@ import os from "node:os";
 import path from "node:path";
 import { createGreaseTools } from "../.github/extensions/grease/core/tools.mjs";
 
+test("capture tool tells agents when and how to record operational friction", () => {
+  const capture = createGreaseTools().find((tool) => tool.name === "grease_capture");
+
+  assert.match(capture.description, /whenever you encounter operational friction/i);
+  assert.match(capture.description, /without waiting for the user/i);
+  assert.match(capture.parameters.properties.summary.description, /attempted/i);
+  assert.match(capture.parameters.properties.summary.description, /expected/i);
+  assert.match(capture.parameters.properties.summary.description, /actual/i);
+  assert.match(capture.parameters.properties.summary.description, /impact/i);
+  assert.match(capture.parameters.properties.evidence.description, /reproduce/i);
+  assert.match(capture.parameters.properties.evidence.description, /secret/i);
+  assert.deepEqual(capture.parameters.required, [
+    "title",
+    "summary",
+    "severity",
+    "kind",
+    "source",
+    "evidence"
+  ]);
+  assert.equal(capture.parameters.properties.evidence.type, "string");
+});
+
 test("tools capture, search, and brief", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
   try {
@@ -15,7 +37,8 @@ test("tools capture, search, and brief", async () => {
       severity: "high",
       kind: "access-denied",
       source: "mcp",
-      tags: ["atrium", "mcp"]
+      tags: ["atrium", "mcp"],
+      evidence: "Call atrium.run with tool xray. It returns access denied."
     });
     assert.equal(capture.ok, true);
 
