@@ -4,7 +4,9 @@ import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:f
 import os from "node:os";
 import path from "node:path";
 
-const CATALOG_VERSION = 4;
+const CATALOG_VERSION = 5;
+const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
+const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
 const STORE_LOCK_STALE_MS = 30_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
@@ -56,8 +58,22 @@ export async function rebuildCatalog(options = {}) {
 async function rebuildCatalogUnlocked(root) {
   await ensureStore(root);
   const events = await readEvents({ root });
-  const catalog = buildCatalog(events);
-  await writeJsonAtomic(catalogPath(root), catalog);
+  const sourceEventLogBytes = await readSourceEventLogBytes(root);
+  const generationId = buildGenerationId(events, sourceEventLogBytes);
+  let generatedAt = new Date().toISOString();
+  try {
+    const existingCatalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
+    if (existingCatalog?.version === CATALOG_VERSION && existingCatalog?.generationId === generationId) {
+      generatedAt = existingCatalog.generatedAt;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const catalog = buildCatalog(events, { generatedAt, generationId, sourceEventLogBytes });
+  const active = buildActiveProjection(catalog);
+  await writeJsonFilesAtomic(root, catalog, active);
   return catalog;
 }
 
@@ -73,6 +89,25 @@ export async function readCatalog(options = {}) {
   } catch (error) {
     if (error?.code === "ENOENT") {
       return rebuildCatalog({ root });
+    }
+    throw error;
+  }
+}
+
+export async function readActiveCatalog(options = {}) {
+  const root = options.root ?? defaultStoreRoot();
+  await ensureStore(root);
+  const activeFilePath = activePath(root);
+  try {
+    const active = JSON.parse(await readFile(activeFilePath, "utf8"));
+    const sourceEventLogBytes = await readSourceEventLogBytes(root);
+    if (active.version !== CATALOG_VERSION || active.sourceEventLogBytes !== sourceEventLogBytes) {
+      return rebuildActiveCatalog(root);
+    }
+    return { ...active, path: activeFilePath };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return rebuildActiveCatalog(root);
     }
     throw error;
   }
@@ -161,10 +196,13 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
   });
 }
 
-export function buildCatalog(events) {
+export function buildCatalog(events, options = {}) {
   const items = new Map();
   const occurrences = [];
   const updates = [];
+  const generatedAt = options.generatedAt ?? new Date().toISOString();
+  const generationId = options.generationId ?? buildGenerationId(events, options.sourceEventLogBytes ?? 0);
+  const sourceEventLogBytes = options.sourceEventLogBytes ?? 0;
 
   for (const event of events) {
     if (event.type === "friction.signal") {
@@ -247,7 +285,9 @@ export function buildCatalog(events) {
 
   return {
     version: CATALOG_VERSION,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
+    generationId,
+    sourceEventLogBytes,
     items: [...items.values()].sort(sortItems),
     occurrences: occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)))
   };
@@ -257,7 +297,8 @@ export function pathsForStore(root = defaultStoreRoot()) {
   return {
     root,
     events: eventsPath(root),
-    catalog: catalogPath(root)
+    catalog: catalogPath(root),
+    active: activePath(root)
   };
 }
 
@@ -311,17 +352,27 @@ function catalogPath(root) {
   return path.join(root, "catalog.json");
 }
 
+function activePath(root) {
+  return path.join(root, "active.json");
+}
+
 function storeLockPath(root) {
   return path.join(root, "catalog.lock");
 }
 
-async function writeJsonAtomic(filePath, value) {
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
+async function writeJsonFilesAtomic(root, catalog, active) {
+  const catalogTempPath = `${catalogPath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
+  const activeTempPath = `${activePath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
   try {
-    await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await replaceFileWithRetry(tempPath, filePath);
+    await Promise.all([
+      writeFile(catalogTempPath, `${JSON.stringify(catalog, null, 2)}\n`, "utf8"),
+      writeFile(activeTempPath, `${JSON.stringify(active)}\n`, "utf8")
+    ]);
+    await replaceFileWithRetry(catalogTempPath, catalogPath(root));
+    await replaceFileWithRetry(activeTempPath, activePath(root));
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => undefined);
+    await rm(catalogTempPath, { force: true }).catch(() => undefined);
+    await rm(activeTempPath, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -411,6 +462,62 @@ function isRetryableReplaceError(error) {
 
 async function waitForRetry() {
   await scheduler.wait(25);
+}
+
+function buildGenerationId(events, sourceEventLogBytes) {
+  const lastEvent = events.length > 0 ? events[events.length - 1] : undefined;
+  return hash([
+    String(CATALOG_VERSION),
+    String(sourceEventLogBytes),
+    String(events.length),
+    String(lastEvent?.id ?? ""),
+    String(lastEvent?.at ?? ""),
+    String(lastEvent?.type ?? "")
+  ]);
+}
+
+function buildActiveProjection(catalog) {
+  const items = (catalog.items ?? []).filter((item) => ACTIVE_STATUSES.includes(item.status));
+  const statusCounts = Object.fromEntries(ALL_STATUSES.map((status) => [status, 0]));
+  for (const item of catalog.items ?? []) {
+    if (statusCounts[item.status] !== undefined) {
+      statusCounts[item.status] += 1;
+    }
+  }
+  const activeIds = new Set(items.map((item) => item.id));
+  const occurrences = [];
+  for (const occurrence of catalog.occurrences ?? []) {
+    if (activeIds.has(occurrence.frictionId)) {
+      occurrences.push({ ...occurrence });
+    }
+  }
+  return {
+    version: catalog.version,
+    generatedAt: catalog.generatedAt,
+    generationId: catalog.generationId,
+    sourceEventLogBytes: catalog.sourceEventLogBytes,
+    items: items.map((item) => ({ ...item })),
+    occurrences,
+    statusCounts
+  };
+}
+
+async function rebuildActiveCatalog(root) {
+  await rebuildCatalog({ root });
+  const activeFilePath = activePath(root);
+  const projection = JSON.parse(await readFile(activeFilePath, "utf8"));
+  return { ...projection, path: activeFilePath };
+}
+
+async function readSourceEventLogBytes(root) {
+  try {
+    return (await stat(eventsPath(root))).size;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return 0;
+    }
+    throw error;
+  }
 }
 
 function sortItems(a, b) {
