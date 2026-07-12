@@ -62,6 +62,48 @@ test("tools capture, search, and brief", async () => {
   }
 });
 
+test("grease brief surfaces extension-name-resolution guidance for extensions_manage inspect failures", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const error = {
+      message: 'Extension "project:backlog" not found. Available extensions: user:backlog, user:grease, user:uhura',
+      arguments: {
+        operation: "inspect",
+        name: "project:backlog"
+      }
+    };
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "extensions_manage",
+      error,
+      arguments: error.arguments
+    }, {
+      sessionId: "session-extension-name",
+      sessionName: "Extension name session",
+      workingDirectory: "C:\\repo"
+    });
+    await appendEvent(signal, { root, now: "2026-06-10T12:00:00.000Z" });
+
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const search = await callTool(tools.get("grease_search"), {
+      query: "project:backlog"
+    });
+    assert.equal(search.data.items.length, 1);
+
+    const brief = await callTool(tools.get("grease_brief"), {
+      ids: [search.data.items[0].id]
+    });
+    assert.match(brief.data.prompt, /extension-name resolution/i);
+    assert.match(brief.data.prompt, /requested extension name/i);
+    assert.match(brief.data.prompt, /project:backlog/i);
+    assert.match(brief.data.prompt, /suggested extension IDs/i);
+    assert.match(brief.data.prompt, /user:backlog/i);
+    assert.match(brief.data.prompt, /reload the extension host or install the extension with the fully qualified extension ID/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("grease status tool preserves its public result shape from the active summary", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
   try {

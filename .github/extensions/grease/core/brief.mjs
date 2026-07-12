@@ -62,6 +62,10 @@ export async function buildBrief(input = {}, options = {}) {
     if (latest?.evidence?.error) {
       lines.push(`- latest error: ${latest.evidence.error}`);
     }
+    const extensionNameDiagnosisLines = getExtensionNameDiagnosisLines(latest);
+    if (extensionNameDiagnosisLines.length > 0) {
+      lines.push(...extensionNameDiagnosisLines);
+    }
     lines.push("");
   }
 
@@ -105,4 +109,54 @@ function formatOrigins(item) {
     || item.sessionIds?.map((id) => `session ${String(id).slice(0, 8)}`).join(", ")
     || "unknown session";
   return `${machines} / ${sessions}`;
+}
+
+function getExtensionNameDiagnosisLines(latest) {
+  const guardrailRootCause = latest?.evidence?.guardrailRootCause;
+  if (guardrailRootCause?.category !== "extension-name-resolution") {
+    return [];
+  }
+
+  const requestedExtensionName = guardrailRootCause.requestedExtensionName
+    || guardrailRootCause.requestedName
+    || guardrailRootCause.extensionName
+    || "";
+  const suggestedExtensionIds = normalizeSuggestedExtensionIds(
+    guardrailRootCause.suggestedExtensions,
+    guardrailRootCause.suggestedExtensionIds
+  );
+  const fullyQualifiedExtensionId = guardrailRootCause.fullyQualifiedExtensionId
+    || guardrailRootCause.extensionId
+    || "";
+
+  const lines = [
+    "- extension-name resolution: inspect the requested extension name and resolve it to a real extension ID before retrying."
+  ];
+  if (requestedExtensionName) {
+    lines.push(`- requested extension name: ${requestedExtensionName}`);
+  }
+  if (suggestedExtensionIds.length > 0) {
+    lines.push(`- suggested extension IDs: ${suggestedExtensionIds.join(", ")}`);
+  }
+  if (fullyQualifiedExtensionId) {
+    lines.push(`- fully qualified extension ID: ${fullyQualifiedExtensionId}`);
+  } else {
+    lines.push("- guidance: reload the extension host or install the extension with the fully qualified extension ID if it is available locally.");
+  }
+  return lines;
+}
+
+function normalizeSuggestedExtensionIds(suggestedExtensions, suggestedExtensionIds) {
+  const values = [];
+  if (Array.isArray(suggestedExtensions)) {
+    values.push(...suggestedExtensions.filter(Boolean));
+  } else if (suggestedExtensions) {
+    values.push(suggestedExtensions);
+  }
+  if (Array.isArray(suggestedExtensionIds)) {
+    values.push(...suggestedExtensionIds.filter(Boolean));
+  } else if (suggestedExtensionIds) {
+    values.push(suggestedExtensionIds);
+  }
+  return values.filter((value, index, all) => value && all.indexOf(value) === index);
 }
