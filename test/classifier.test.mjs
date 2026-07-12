@@ -136,6 +136,34 @@ test("classifies organization content policy denials as policy guardrails", () =
   assert.equal(signal.signal.evidence.guardrailRootCause.workingDirectory, undefined);
 });
 
+test("diagnoses extensions_manage inspect failures with extension-name resolution guardrails", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "extensions_manage",
+    toolCallId: "call-extensions-name",
+    error: {
+      message: "Extension \"project:backlog\" not found. Available extensions: user:backlog, user:grease, user:uhura",
+      code: "failure"
+    },
+    arguments: {
+      operation: "inspect",
+      name: "project:backlog"
+    }
+  });
+
+  assert.equal(signal.signal.kind, "policy-block");
+  assert.equal(signal.signal.source, "local-tool");
+  assert.deepEqual(signal.signal.tags, ["policy-block", "guardrail", "local-tool"]);
+
+  const rootCause = signal.signal.evidence.guardrailRootCause;
+  assert.equal(rootCause.category, "extension-name-resolution");
+  assert.equal(rootCause.requestedName, "project:backlog");
+  assert.equal(rootCause.operation, "inspect");
+  assert.deepEqual(rootCause.availableExtensions, ["user:backlog", "user:grease", "user:uhura"]);
+  assert.deepEqual(rootCause.suggestedExtensions, ["user:backlog", "user:grease", "user:uhura"]);
+  assert.match(rootCause.fix, /(fully qualified extension IDs|reload|install)/i);
+});
+
 test("does not classify argument paths as policy blocks", () => {
   const [signal] = classifySessionEvent("tool.execution_complete", {
     success: false,

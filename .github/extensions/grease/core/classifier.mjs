@@ -18,6 +18,8 @@ const CLOUD_QUERY_TIMEOUT = /\bcloudqueryerror\b[\s\S]*\bquery timed out\b/i;
 const GITHUB_REPOSITORY_NOT_FOUND = /\bgithub\.com\/repos\/([^/\s]+)\/([^:\s]+):\s*404\s+not\s+found\b/i;
 const GITHUB_CODE_QUERY_PARSE_ERROR = /\bsearch\/code\b[\s\S]*\b422\b[\s\S]*\bquery_parsing_fatal\b|\bunable to parse query\b/i;
 const MISSING_FILE_OPEN = /\benoent\b[\s\S]*\bno such file or directory\b[\s\S]*\bopen '([^']+)'/i;
+const EXTENSION_NAME_RESOLUTION = /\b(?:extension|extension name)\b[\s\S]{0,200}\b(?:not found|not available|could not be found|was not found|ambiguous)\b/i;
+const AVAILABLE_EXTENSIONS = /\bavailable extensions\b/i;
 
 const LOCAL_TOOL_NAMES = new Set([
   "powershell",
@@ -107,7 +109,7 @@ function classifyToolFailure(data, context) {
     data.toolArgs
   ].map((value) => summarizeValue(value, 1200)).filter(Boolean).join("\n");
   const details = [failureDetails, argumentDetails].filter(Boolean).join("\n");
-  const kind = classifyFailureKind(toolName, failureDetails);
+  const kind = classifyFailureKind(toolName, failureDetails, data.arguments ?? data.toolArgs);
   const title = titleForToolFailure(toolName, kind);
   const severity = severityForKind(kind);
   return [{
@@ -259,8 +261,11 @@ function isInjectedContextOnlyMessage(content) {
     || /^<system_notification\b[\s\S]*<\/system_notification>\s*$/i.test(text);
 }
 
-function classifyFailureKind(toolName, details) {
+function classifyFailureKind(toolName, details, rawArguments) {
   const haystack = `${toolName}\n${details}`;
+  if (isExtensionNameResolutionFailure(toolName, details, rawArguments)) {
+    return "policy-block";
+  }
   if (POLICY.test(haystack)) {
     return "policy-block";
   }
@@ -358,6 +363,9 @@ function guardrailRootCauseFor(toolName, kind, failureDetails, argumentDetails, 
     return undefined;
   }
   const normalizedTool = String(toolName).toLowerCase();
+  if (isExtensionNameResolutionFailure(toolName, failureDetails, rawArguments)) {
+    return extensionNameResolutionRootCause(failureDetails, rawArguments);
+  }
   if (isDirectSearchTool(normalizedTool) && /\bsearch-policy\b/i.test(details)) {
     return {
       category: "direct-search-tool",
@@ -386,6 +394,129 @@ function guardrailRootCauseFor(toolName, kind, failureDetails, argumentDetails, 
     cause: "The agent attempted an action blocked by policy.",
     fix: "Use the captured decisionContext to fix the prompt, skill, fallback, subagent context, or tool-selection path that selected the blocked action."
   };
+}
+
+function isExtensionNameResolutionFailure(toolName, details, rawArguments) {
+  const normalizedTool = String(toolName).toLowerCase();
+  if (normalizedTool !== "extensions_manage") {
+    return false;
+  }
+  const args = normalizeToolArguments(rawArguments);
+  const operation = stringValue(args?.operation);
+  const normalizedOperation = operation ? operation.toLowerCase() : "inspect";
+  if (normalizedOperation !== "inspect") {
+    return false;
+  }
+  const haystack = String(details ?? "");
+  return EXTENSION_NAME_RESOLUTION.test(haystack) || AVAILABLE_EXTENSIONS.test(haystack);
+}
+
+function extensionNameResolutionRootCause(failureDetails, rawArguments) {
+  const args = normalizeToolArguments(rawArguments);
+  const operation = stringValue(args?.operation) ?? "inspect";
+  const requestedName = firstDefinedString(args?.name, args?.extensionName, extensionNameFromFailure(failureDetails));
+  const availableExtensions = parseAvailableExtensions(failureDetails);
+  const suggestedExtensions = suggestExtensionNames(requestedName, availableExtensions);
+  return {
+    category: "extension-name-resolution",
+    operation,
+    requestedName,
+    availableExtensions,
+    suggestedExtensions,
+    fix: extensionNameResolutionFix(requestedName, availableExtensions)
+  };
+}
+
+function firstDefinedString(...values) {
+  for (const value of values) {
+    const text = stringValue(value);
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
+function suggestExtensionNames(requestedName, availableExtensions) {
+  if (availableExtensions.length === 0) {
+    return [requestedName].filter(Boolean);
+  }
+  const requestedBase = extensionBasename(requestedName);
+  if (!requestedBase) {
+    return availableExtensions;
+  }
+  const matchingExtensions = availableExtensions.filter((extension) => extensionBasename(extension) === requestedBase);
+  if (matchingExtensions.length === 0) {
+    return availableExtensions;
+  }
+  const remainingExtensions = availableExtensions.filter((extension) => !matchingExtensions.includes(extension));
+  return [...matchingExtensions, ...remainingExtensions];
+}
+
+function extensionBasename(value) {
+  const text = stringValue(value);
+  if (!text) {
+    return undefined;
+  }
+  const segments = text.split(/[:/\\]/).filter(Boolean);
+  return segments[segments.length - 1];
+}
+
+function extensionNameResolutionFix(requestedName, availableExtensions) {
+  const examples = availableExtensions.filter(Boolean).slice(0, 3);
+  const exampleText = examples.length > 0 ? ` such as ${examples.join(", ")}` : "";
+  return `Use fully qualified extension IDs${exampleText} or reload/install the extension with the correct ID.`;
+}
+
+function extensionNameFromFailure(failureDetails) {
+  const match = /(?:extension|extension name)\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:-]+))/i.exec(String(failureDetails ?? ""));
+  return match?.[1] ?? match?.[2] ?? match?.[3];
+}
+
+function parseAvailableExtensions(failureDetails) {
+  const match = /\bavailable extensions\b\s*:\s*(.+)/i.exec(String(failureDetails ?? ""));
+  if (!match) {
+    return [];
+  }
+
+  const rawList = match[1];
+  const entries = [];
+  let current = "";
+
+  for (const char of rawList) {
+    if (char === "\n" || char === "\r" || char === "{" || char === "[" || char === "(" || char === "}" || char === "]" || char === ")" || char === '"' || char === "'") {
+      break;
+    }
+    if (char === ",") {
+      const trimmed = current.trim();
+      if (trimmed) {
+        entries.push(trimmed);
+      }
+      current = "";
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current.length > 0) {
+        current += char;
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  const lastEntry = current.trim();
+  if (lastEntry) {
+    entries.push(lastEntry);
+  }
+
+  return entries
+    .map((entry) => entry.replace(/^[\s"'[{(]+|[\s"'\]})]+$/g, "").trim())
+    .filter(Boolean)
+    .filter((entry) => looksLikeExtensionIdentifier(entry));
+}
+
+function looksLikeExtensionIdentifier(value) {
+  return /^[A-Za-z0-9._:/-]+$/.test(String(value ?? ""));
 }
 
 function isDirectSearchTool(normalizedTool) {
