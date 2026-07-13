@@ -701,13 +701,21 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
     }
   }
   if (normalizedTool === "web_fetch" && WEB_FETCH_REDIRECT.test(failureDetails)) {
-    return {
+    const requestedMaxLength = numberValue(args?.max_length);
+    const recommendedMaxLength = 5000;
+    const diagnosis = {
       category: "redirect-requires-explicit-url",
       cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
       fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
       originalUrl: stringValue(args?.url),
-      redirectUrl: redirectUrlFrom(failureDetails)
+      redirectUrl: redirectUrlFrom(failureDetails),
+      recommendedMaxLength,
+      recovery: webFetchRedirectRecovery(requestedMaxLength, recommendedMaxLength)
     };
+    if (requestedMaxLength !== undefined) {
+      diagnosis.requestedMaxLength = requestedMaxLength;
+    }
+    return diagnosis;
   }
   return undefined;
 }
@@ -1062,6 +1070,10 @@ function stringValue(value) {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
+function numberValue(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function parentDirectoryOf(value) {
   const filePath = stringValue(value);
   if (!filePath) {
@@ -1095,6 +1107,19 @@ function redirectUrlFrom(details) {
     return undefined;
   }
   return match[1].replace(/[.,;]+$/, "");
+}
+
+function webFetchRedirectRecovery(requestedMaxLength, recommendedMaxLength) {
+  const reduceStep = typeof requestedMaxLength === "number"
+    ? `Reduce the requested max_length ${requestedMaxLength} to a bounded length of ${recommendedMaxLength} for the first page, then page with start_index only when more content is proven necessary.`
+    : `Fetch a bounded length of ${recommendedMaxLength} for the first page, then page with start_index only when more content is proven necessary.`;
+  return {
+    text: "Retry once with the final URL from the redirect, fetch a bounded length first page, and do not re-fetch the shortened URL.",
+    steps: [
+      "Retry once with the final URL named in the redirect error instead of the shortened URL, so the destination can be permission-checked.",
+      reduceStep
+    ]
+  };
 }
 
 function getResultType(data) {
