@@ -701,21 +701,7 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
     }
   }
   if (normalizedTool === "web_fetch" && WEB_FETCH_REDIRECT.test(failureDetails)) {
-    const requestedMaxLength = numberValue(args?.max_length);
-    const recommendedMaxLength = 5000;
-    const diagnosis = {
-      category: "redirect-requires-explicit-url",
-      cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
-      fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
-      originalUrl: stringValue(args?.url),
-      redirectUrl: redirectUrlFrom(failureDetails),
-      recommendedMaxLength,
-      recovery: webFetchRedirectRecovery(requestedMaxLength, recommendedMaxLength)
-    };
-    if (requestedMaxLength !== undefined) {
-      diagnosis.requestedMaxLength = requestedMaxLength;
-    }
-    return diagnosis;
+    return webFetchRedirectDiagnosis(failureDetails, rawArguments);
   }
   return undefined;
 }
@@ -1099,6 +1085,41 @@ function patchTargetPath(rawArguments) {
 
 function missingRequiredField(details) {
   return MISSING_REQUIRED_FIELD.exec(details)?.[1]?.replace(/\\+$/g, "");
+}
+
+function webFetchRedirectDiagnosis(failureDetails, rawArguments) {
+  const args = normalizeToolArguments(rawArguments);
+  const requestedMaxLength = webFetchRequestedMaxLength(args);
+  const recommendedMaxLength = 5000;
+  const diagnosis = {
+    category: "redirect-requires-explicit-url",
+    cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
+    fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
+    originalUrl: firstDefinedString(args?.url, args?.originalUrl),
+    redirectUrl: redirectUrlFrom(failureDetails),
+    recovery: webFetchRedirectRecovery(requestedMaxLength, recommendedMaxLength)
+  };
+
+  if (requestedMaxLength !== undefined) {
+    diagnosis.requestedMaxLength = requestedMaxLength;
+  }
+  if (requestedMaxLength !== undefined && requestedMaxLength > recommendedMaxLength) {
+    diagnosis.recommendedMaxLength = recommendedMaxLength;
+  }
+
+  return diagnosis;
+}
+
+function webFetchRequestedMaxLength(args) {
+  const rawMaxLength = args?.max_length ?? args?.maxLength;
+  if (typeof rawMaxLength === "number" && Number.isFinite(rawMaxLength)) {
+    return rawMaxLength;
+  }
+  if (typeof rawMaxLength === "string" && rawMaxLength.trim() !== "") {
+    const parsed = Number.parseInt(rawMaxLength, 10);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
 }
 
 function redirectUrlFrom(details) {
