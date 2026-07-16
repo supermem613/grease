@@ -463,7 +463,7 @@ test("diagnoses web_fetch redirects with bounded-length retry guidance", () => {
   const [signal] = classifySessionEvent("tool.execution_complete", {
     success: false,
     toolName: "web_fetch",
-    error: "WebFetchRedirectError: web_fetch refused to follow redirect 301 to https://x.com/i/article/2074204645845839872",
+    error: "WebFetchRedirectError: web_fetch refused to follow redirect 301 from https://t.co/v694m8Eaj6 to https://x.com/i/article/2074204645845839872.",
     arguments: {
       url: "https://t.co/v694m8Eaj6",
       max_length: 20000,
@@ -477,9 +477,13 @@ test("diagnoses web_fetch redirects with bounded-length retry guidance", () => {
   assert.equal(diagnosis.redirectUrl, "https://x.com/i/article/2074204645845839872");
   assert.equal(diagnosis.requestedMaxLength, 20000);
   assert.equal(diagnosis.recommendedMaxLength, 5000);
-  assert.match(recoveryText(diagnosis), /retry/i);
-  assert.match(recoveryText(diagnosis), /final URL/i);
-  assert.match(recoveryText(diagnosis), /5000/);
+
+  const recovery = recoveryText(diagnosis);
+  assert.match(recovery, /retry once/i);
+  assert.match(recovery, /final URL/i);
+  assert.match(recovery, /bounded length/i);
+  assert.match(recovery, /shortened URL/i);
+  assert.match(recovery, /max_length 20000/i);
 });
 
 test("diagnoses session store SQL cloud query timeouts", () => {
