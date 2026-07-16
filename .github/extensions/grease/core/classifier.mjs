@@ -701,13 +701,7 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
     }
   }
   if (normalizedTool === "web_fetch" && WEB_FETCH_REDIRECT.test(failureDetails)) {
-    return {
-      category: "redirect-requires-explicit-url",
-      cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
-      fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
-      originalUrl: stringValue(args?.url),
-      redirectUrl: redirectUrlFrom(failureDetails)
-    };
+    return webFetchRedirectDiagnosis(failureDetails, rawArguments);
   }
   return undefined;
 }
@@ -1087,6 +1081,48 @@ function patchTargetPath(rawArguments) {
 
 function missingRequiredField(details) {
   return MISSING_REQUIRED_FIELD.exec(details)?.[1]?.replace(/\\+$/g, "");
+}
+
+function webFetchRedirectDiagnosis(failureDetails, rawArguments) {
+  const args = normalizeToolArguments(rawArguments);
+  const requestedMaxLength = webFetchRequestedMaxLength(args);
+  const diagnosis = {
+    category: "redirect-requires-explicit-url",
+    cause: "web_fetch refused an HTTP redirect so the redirected URL can be permission-checked explicitly.",
+    fix: "Re-invoke web_fetch with the final URL from the error, or use an authenticated browser/workflow when the redirect is a sign-in challenge.",
+    originalUrl: firstDefinedString(args?.url, args?.originalUrl),
+    redirectUrl: redirectUrlFrom(failureDetails)
+  };
+
+  if (requestedMaxLength !== undefined) {
+    diagnosis.requestedMaxLength = requestedMaxLength;
+  }
+  if (requestedMaxLength !== undefined && requestedMaxLength > 5000) {
+    diagnosis.recommendedMaxLength = 5000;
+  }
+
+  const boundedLength = requestedMaxLength !== undefined && requestedMaxLength > 5000 ? "5000" : "the requested length";
+  diagnosis.recovery = {
+    text: `Retry once with the final URL from the redirect and a bounded first-page length of ${boundedLength} or less.`,
+    steps: [
+      "Retry the web_fetch call once with the final URL from the redirect.",
+      `Keep the first fetch page bounded to ${boundedLength} or less.`
+    ]
+  };
+
+  return diagnosis;
+}
+
+function webFetchRequestedMaxLength(args) {
+  const rawMaxLength = args?.max_length ?? args?.maxLength;
+  if (typeof rawMaxLength === "number" && Number.isFinite(rawMaxLength)) {
+    return rawMaxLength;
+  }
+  if (typeof rawMaxLength === "string" && rawMaxLength.trim() !== "") {
+    const parsed = Number.parseInt(rawMaxLength, 10);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
 }
 
 function redirectUrlFrom(details) {

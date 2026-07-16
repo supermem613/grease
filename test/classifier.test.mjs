@@ -459,6 +459,29 @@ test("diagnoses web_fetch redirects requiring explicit URLs", () => {
   assert.match(signal.signal.evidence.failureDiagnosis.redirectUrl, /^https:\/\/spsprodwus22\.vssps\.visualstudio\.com\/_signin/);
 });
 
+test("diagnoses web_fetch redirects with bounded-length retry guidance", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "web_fetch",
+    error: "WebFetchRedirectError: web_fetch refused to follow redirect 301 to https://x.com/i/article/2074204645845839872",
+    arguments: {
+      url: "https://t.co/v694m8Eaj6",
+      max_length: 20000,
+      raw: false
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "redirect-requires-explicit-url");
+  assert.equal(diagnosis.originalUrl, "https://t.co/v694m8Eaj6");
+  assert.equal(diagnosis.redirectUrl, "https://x.com/i/article/2074204645845839872");
+  assert.equal(diagnosis.requestedMaxLength, 20000);
+  assert.equal(diagnosis.recommendedMaxLength, 5000);
+  assert.match(recoveryText(diagnosis), /retry/i);
+  assert.match(recoveryText(diagnosis), /final URL/i);
+  assert.match(recoveryText(diagnosis), /5000/);
+});
+
 test("diagnoses session store SQL cloud query timeouts", () => {
   const [signal] = classifySessionEvent("tool.execution_complete", {
     success: false,
