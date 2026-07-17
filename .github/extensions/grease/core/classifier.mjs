@@ -13,6 +13,9 @@ const PATCH_CONTEXT_MISSING = /\bfailed to find expected lines\b/i;
 const MEMORY_REPOSITORY_MISSING = /\brepository was not found\b/i;
 const AGENT_NOT_FOUND = /\bagent not found\b/i;
 const MISSING_REQUIRED_FIELD = /"([^"]+)":\s*required/i;
+const TOOL_NOT_FOUND = /\btool\s+'([^']+)'\s+does not exist\b|\btool\s+"([^"]+)"\s+does not exist\b/i;
+const SKILL_NOT_FOUND = /\bskill not found:\s*([A-Za-z0-9._:-]+)/i;
+const ASK_USER_SCHEMA_TYPE = /"?(requestedSchema\.properties\.[^":\s]+)"?\s*:\s*Invalid input|requestedSchema\.properties\.([A-Za-z0-9_-]+)[\s\S]*\btype\b/i;
 const WEB_FETCH_REDIRECT = /\bwebfetchredirecterror\b|\brefused to follow redirect\b/i;
 const CLOUD_QUERY_TIMEOUT = /\bcloudqueryerror\b[\s\S]*\bquery timed out\b/i;
 const GITHUB_REPOSITORY_NOT_FOUND = /\bgithub\.com\/repos\/([^/\s]+)\/([^:\s]+):\s*404\s+not\s+found\b/i;
@@ -585,6 +588,27 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
   const args = normalizeToolArguments(rawArguments);
   const currentPath = stringValue(args?.path);
   const knownFileBackedPaths = collectFileBackedPaths(args, decisionContext);
+  const missingField = missingRequiredField(failureDetails);
+  if (missingField) {
+    return {
+      category: "tool-schema-missing-field",
+      cause: `The ${toolName} call omitted required field '${missingField}'.`,
+      fix: "Build tool calls from the declared schema and include all required fields before invocation.",
+      missingField
+    };
+  }
+  if (TOOL_NOT_FOUND.test(failureDetails)) {
+    return toolNameAliasDiagnosis(toolName, failureDetails);
+  }
+  if (normalizedTool === "skill" && SKILL_NOT_FOUND.test(failureDetails)) {
+    return skillNotFoundDiagnosis(failureDetails, args);
+  }
+  if (normalizedTool === "ask_user" && ASK_USER_SCHEMA_TYPE.test(failureDetails)) {
+    return askUserSchemaDiagnosis(failureDetails);
+  }
+  if (isSearchPrimitive(normalizedTool) && isBroadSearchRoot(args) && (ACCESS_DENIED.test(failureDetails) || TIMEOUT.test(failureDetails))) {
+    return broadSearchRootDiagnosis(args);
+  }
   if (normalizedTool === "session_store_sql" && kind === "timeout" && CLOUD_QUERY_TIMEOUT.test(failureDetails)) {
     return sessionStoreSqlTimeoutDiagnosis(args);
   }
@@ -681,27 +705,115 @@ function failureDiagnosisFor(toolName, kind, failureDetails, rawArguments, decis
       subject: stringValue(args?.subject)
     };
   }
-  if (normalizedTool === "read_agent" && AGENT_NOT_FOUND.test(failureDetails)) {
+  if ((normalizedTool === "read_agent" || normalizedTool === "write_agent") && AGENT_NOT_FOUND.test(failureDetails)) {
     return {
       category: "stale-agent-id",
-      cause: "The read_agent call referenced an agent id that was not live in the current session.",
-      fix: "Only read agent ids returned by this session, and refresh with list_agents when resuming after reloads or session changes.",
-      agentId: stringValue(args?.agent_id)
+      cause: "The agent tool call referenced an agent id that was not live in the current session.",
+      fix: "Confirm the agent is live before read/write. If it is missing, launch a fresh background agent instead of retrying the stale handle.",
+      agentId: stringValue(args?.agent_id),
+      recovery: {
+        text: "Use list_agents or a current completion notification to confirm liveness before read/write. Launch a fresh background agent when the id is missing.",
+        steps: [
+          "Confirm the target agent is visible in the current session.",
+          "If the handle is missing, launch a fresh background agent and send the event there."
+        ]
+      }
     };
-  }
-  if (normalizedTool === "task") {
-    const missingField = missingRequiredField(failureDetails);
-    if (missingField) {
-      return {
-        category: "tool-schema-missing-field",
-        cause: `The task call omitted required field '${missingField}'.`,
-        fix: "Build tool calls from the declared schema and include all required fields before invocation.",
-        missingField
-      };
-    }
   }
   if (normalizedTool === "web_fetch" && WEB_FETCH_REDIRECT.test(failureDetails)) {
     return webFetchRedirectDiagnosis(failureDetails, rawArguments);
+  }
+
+  function toolNameAliasDiagnosis(toolName, failureDetails) {
+    const requestedTool = TOOL_NOT_FOUND.exec(failureDetails)?.[1] ?? TOOL_NOT_FOUND.exec(failureDetails)?.[2] ?? String(toolName);
+    const suggestedTool = toolAliasFor(requestedTool);
+    return {
+      category: suggestedTool ? "tool-name-alias" : "unknown-tool-name",
+      cause: `The requested tool '${requestedTool}' is not registered in the current tool surface.`,
+      fix: suggestedTool ? `Use '${suggestedTool}' instead of '${requestedTool}'.` : "Refresh the available tool list or use the registered tool name exactly.",
+      requestedTool,
+      suggestedTool
+    };
+  }
+
+  function toolAliasFor(toolName) {
+    const aliases = new Map([
+      ["atrium_grep-code", "atrium-grep-code"],
+      ["atrium_grep", "atrium-grep"],
+      ["atrium_find-files", "atrium-find-files"],
+      ["read-powershell", "read_powershell"],
+      ["stop-powershell", "stop_powershell"]
+    ]);
+    return aliases.get(String(toolName ?? ""));
+  }
+
+  function skillNotFoundDiagnosis(failureDetails, args) {
+    const skill = stringValue(args?.skill) ?? SKILL_NOT_FOUND.exec(failureDetails)?.[1];
+    return {
+      category: "skill-not-found",
+      cause: "The requested skill was not loaded or not discoverable in the current skill registry.",
+      fix: "Reload skills or invoke an available skill name exactly. If the skill should exist, install or relink it before retrying.",
+      skill,
+      recovery: {
+        text: "Reload or install the missing skill before retrying the skill invocation.",
+        steps: [
+          "Check the skill name against the loaded skills.",
+          "Reload or install the skill, then retry with the exact registered name."
+        ]
+      }
+    };
+  }
+
+  function askUserSchemaDiagnosis(failureDetails) {
+    const match = ASK_USER_SCHEMA_TYPE.exec(failureDetails);
+    const fieldPath = (match?.[1] ?? (match?.[2] ? `requestedSchema.properties.${match[2]}` : undefined))?.replace(/\\+$/g, "");
+    return {
+      category: "ask-user-schema-missing-type",
+      cause: "The ask_user requestedSchema field is missing an explicit JSON Schema type.",
+      fix: "Add type to every requestedSchema property, including properties that use oneOf or const choices.",
+      fieldPath,
+      recovery: {
+        text: "Add an explicit type to the requestedSchema property before calling ask_user.",
+        steps: [
+          "Set type on the property named in the validation error.",
+          "Keep oneOf or const choices, but do not rely on them as a replacement for type."
+        ]
+      }
+    };
+  }
+
+  function isSearchPrimitive(toolName) {
+    return ["atrium-find-files", "atrium-grep", "atrium-grep-code", "glob", "rg"].includes(toolName);
+  }
+
+  function isBroadSearchRoot(args) {
+    const root = stringValue(args?.root) ?? stringValue(args?.path) ?? stringValue(args?.paths);
+    if (!root) {
+      return false;
+    }
+    const normalized = root.replace(/\//g, "\\").replace(/\\+$/g, "").toLowerCase();
+    return /^[a-z]:\\users\\[^\\]+$/.test(normalized)
+      || /\\\.copilot\\session-state$/.test(normalized)
+      || /\\appdata$/.test(normalized)
+      || /\\repos$/.test(normalized);
+  }
+
+  function broadSearchRootDiagnosis(args) {
+    const root = stringValue(args?.root) ?? stringValue(args?.path) ?? stringValue(args?.paths);
+    return {
+      category: "broad-search-root",
+      cause: "The search root is broad enough to include protected or very large directories, causing access denied or timeout failures.",
+      fix: "Choose a narrower root inside the target repository or session artifact folder before searching.",
+      root,
+      glob: stringValue(args?.glob),
+      recovery: {
+        text: "Ask for or derive a narrower root, then retry search under that root with a bounded glob.",
+        steps: [
+          "Use the current repository root, a known package directory, or a proven artifact directory instead of the home or session-state root.",
+          "Add a bounded glob or max result cap before retrying."
+        ]
+      }
+    };
   }
   return undefined;
 }

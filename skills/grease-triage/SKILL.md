@@ -66,6 +66,16 @@ A tool that errors correctly on bad input (missing file, bad root, malformed arg
 
 When an item's root cause lives in another repo, do not fix it in place. Relay it to the owner for review, verify the owner's fix live, then resolve. See the `relay` skill.
 
+## Routing a fix to a backlog queue
+
+When a bucket warrants a durable fix (root-cause disposition), it becomes a backlog item in the queue that owns the offending product. Routing is governed by `routing-map.json` in this skill directory. Read it, match the item's captured `tool` and `source` top-down (first match wins), and place the item with `backlog add "<desc>" --cwd <queueDir>` using that queue's directory from the map.
+
+Two separate mappings, two homes. The queue-to-directory bindings live in `~/.backlog/backlog.db` (managed by the backlog extension; inspect with `backlog queue list`). The friction-signature-to-queue policy lives in `routing-map.json` here, version-controlled with the skill. Update the map when a new product or queue appears.
+
+Backlog resolves a queue from the session cwd (exact > worktree-origin > ancestor). Product repos auto-route when work happens inside them. Built-in-tool (`copilot-cli`) and skill/agent (`copilot-skills`) friction is captured while cwd is a victim repo, so cwd cannot classify it; route those explicitly via the map and the `--cwd <anchor>` of the dedicated queue. If no rule matches, HALT and ask which queue owns it. Do not guess.
+
+Every backlog item created from triage must link to an approved POR with in-depth data guidance and examples. A guidance-only instruction change is not a substitute for a root-cause fix and carries a high bar.
+
 ## Closing one item vs many
 
 `grease_update` accepts either a single `id` or an `ids` array.

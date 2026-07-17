@@ -427,6 +427,7 @@ test("diagnoses stale agent ids", () => {
 
   assert.equal(signal.signal.evidence.failureDiagnosis.category, "stale-agent-id");
   assert.equal(signal.signal.evidence.failureDiagnosis.agentId, "shadow-relay-assess");
+  assert.match(recoveryText(signal.signal.evidence.failureDiagnosis), /fresh background agent/i);
 });
 
 test("diagnoses tool schema missing fields", () => {
@@ -442,6 +443,82 @@ test("diagnoses tool schema missing fields", () => {
 
   assert.equal(signal.signal.evidence.failureDiagnosis.category, "tool-schema-missing-field");
   assert.equal(signal.signal.evidence.failureDiagnosis.missingField, "description");
+});
+
+test("diagnoses near-miss tool names", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "atrium_grep-code",
+    error: { message: "Tool 'atrium_grep-code' does not exist.", code: "failure" },
+    arguments: {
+      root: "C:\\Users\\marcusm\\repos\\backlog",
+      query: "burndown"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "tool-name-alias");
+  assert.equal(diagnosis.requestedTool, "atrium_grep-code");
+  assert.equal(diagnosis.suggestedTool, "atrium-grep-code");
+});
+
+test("diagnoses missing skills with refresh guidance", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "skill",
+    error: "Skill not found: looper",
+    arguments: {
+      skill: "looper"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "skill-not-found");
+  assert.equal(diagnosis.skill, "looper");
+  assert.match(recoveryText(diagnosis), /reload/i);
+});
+
+test("diagnoses ask_user schemas missing requested field types", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "ask_user",
+    error: {
+      message: '"requestedSchema.properties.choice": Invalid input: expected type',
+      code: "failure"
+    },
+    arguments: {
+      question: "Pick one",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          choice: {
+            oneOf: [{ const: "a", title: "A" }]
+          }
+        }
+      }
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "ask-user-schema-missing-type");
+  assert.equal(diagnosis.fieldPath, "requestedSchema.properties.choice");
+});
+
+test("diagnoses broad search roots after access denied", () => {
+  const [signal] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "atrium-find-files",
+    error: "FILES_FAILED: rg: .\\Microsoft Policy Platform\\authorityDb: Access is denied. (os error 5)",
+    arguments: {
+      root: "C:\\Users\\marcusm",
+      glob: "**/*"
+    }
+  });
+
+  const diagnosis = signal.signal.evidence.failureDiagnosis;
+  assert.equal(diagnosis.category, "broad-search-root");
+  assert.equal(diagnosis.root, "C:\\Users\\marcusm");
+  assert.match(recoveryText(diagnosis), /narrower root/i);
 });
 
 test("diagnoses web_fetch redirects requiring explicit URLs", () => {

@@ -323,7 +323,12 @@ export async function getFriction(id, options = {}) {
   const catalog = await readCatalog(options);
   const item = catalog.items.find((candidate) => candidate.id === id);
   if (!item) {
-    throw new Error(`Unknown friction item: ${id}`);
+    return {
+      notFound: true,
+      id,
+      recovery: "No Grease item matches this id. Run grease_search with a title, tool name, or symptom to find the current item id.",
+      nearestMatches: nearestFrictionMatches(id, catalog.items)
+    };
   }
   const occurrences = catalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
   return { item, occurrences };
@@ -733,6 +738,43 @@ function sortItems(a, b) {
     return severity;
   }
   return String(b.lastSeen).localeCompare(String(a.lastSeen));
+}
+
+function nearestFrictionMatches(id, items) {
+  const query = String(id ?? "").toLowerCase();
+  return (items ?? [])
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      status: item.status,
+      score: nearestMatchScore(query, item)
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || String(left.title).localeCompare(String(right.title)))
+    .slice(0, 5)
+    .map(({ score, ...item }) => item);
+}
+
+function nearestMatchScore(query, item) {
+  if (!query) {
+    return 1;
+  }
+  const fields = [
+    item.id,
+    item.title,
+    item.latestSummary,
+    item.kind,
+    item.source,
+    ...(item.tags ?? [])
+  ].map((value) => String(value ?? "").toLowerCase());
+  if (fields.some((field) => field === query)) {
+    return 100;
+  }
+  if (fields.some((field) => field.includes(query) || query.includes(field))) {
+    return 50;
+  }
+  const queryPrefix = query.slice(0, 6);
+  return fields.some((field) => field.includes(queryPrefix)) ? 10 : 1;
 }
 
 function severityRank(value) {

@@ -136,6 +136,34 @@ test("grease status tool preserves its public result shape from the active summa
   }
 });
 
+test("grease_get returns typed not-found guidance for stale ids", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    await callTool(tools.get("grease_capture"), {
+      title: "Known issue",
+      summary: "Known issue summary",
+      severity: "medium",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "Known issue evidence"
+    });
+
+    const result = await callTool(tools.get("grease_get"), {
+      id: "0fe2c31529871869"
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.command, "grease_get");
+    assert.equal(result.data.notFound, true);
+    assert.equal(result.data.id, "0fe2c31529871869");
+    assert.match(result.data.recovery, /grease_search/i);
+    assert.ok(Array.isArray(result.data.nearestMatches));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function callTool(tool, args) {
   const result = await tool.handler(args, { sessionId: "session-1", sessionName: "Tool test session" });
   assert.equal(result.resultType, "success");
