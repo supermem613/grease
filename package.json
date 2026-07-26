@@ -1,6 +1,6 @@
 {
   "name": "grease",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Copilot extension that captures friction and turns it into addressable work.",
   "type": "module",
   "private": true,
@@ -11,9 +11,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "check": "node scripts/check.mjs",
+    "check": "node scripts/check.mjs && node scripts/sync-version.mjs --check",
     "test": "node --test",
-    "setup": "node scripts/install-extension-shim.mjs"
+    "setup": "node scripts/install-extension-shim.mjs",
+    "sync-version": "node scripts/sync-version.mjs",
+    "version": "node scripts/sync-version.mjs"
   },
   "keywords": [
     "copilot",

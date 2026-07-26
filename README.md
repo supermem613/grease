@@ -134,6 +134,10 @@ npm test
 
 No runtime dependencies are required. `@github/copilot-sdk` is host-injected by Copilot when the extension runs.
 
+### Versioning
+
+`package.json` holds the version; `plugin.json` repeats it for the extension host. Bump with `npm version patch --no-git-tag-version` and both files move together, because the npm `version` lifecycle hook runs `scripts/sync-version.mjs`. `npm run check` fails on drift, so a manually edited version never reaches CI. To repair drift by hand, run `npm run sync-version`.
+
 ## Design notes
 
 - One extension product owns capture, storage, and tools.
