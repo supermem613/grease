@@ -1,4 +1,4 @@
-import { getFriction, searchCatalog } from "./catalog.mjs";
+import { getFriction, readOccurrencesForId, searchCatalog } from "./catalog.mjs";
 
 const GUARDRAIL_TEXT = /\b(search-policy|content\s+policy|content\s+exclusion|excluded\s+by\s+organization\s+content\s+policy|denied\s+by\s+pretooluse\s+hook|blocked\s+by\s+policy|policy\s+denied)\b/i;
 
@@ -20,7 +20,7 @@ export async function buildBrief(input = {}, options = {}) {
     for (const item of result.items) {
       selected.push({
         item,
-        occurrences: result.catalog.occurrences.filter((occurrence) => occurrence.frictionId === item.id)
+        occurrences: await readOccurrencesForId(item.id, options)
       });
     }
   }

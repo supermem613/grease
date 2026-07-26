@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "
 import os from "node:os";
 import path from "node:path";
 
-const CATALOG_VERSION = 5;
+const CATALOG_VERSION = 6;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
@@ -359,7 +359,7 @@ export async function getFriction(id, options = {}) {
   const activeCatalog = await readActiveCatalog(options);
   const activeItem = activeCatalog.items.find((candidate) => candidate.id === id);
   if (activeItem) {
-    const occurrences = activeCatalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
+    const occurrences = await readOccurrencesForId(id, options);
     return { item: activeItem, occurrences };
   }
   const catalog = await readCatalog(options);
@@ -372,7 +372,7 @@ export async function getFriction(id, options = {}) {
       nearestMatches: nearestFrictionMatches(id, catalog.items)
     };
   }
-  const occurrences = catalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
+  const occurrences = await readOccurrencesForId(id, options);
   return { item, occurrences };
 }
 
@@ -430,24 +430,8 @@ export function buildCatalog(events, options = {}) {
 
   for (const event of events) {
     if (event.type === "friction.signal") {
-      const signal = event.signal ?? {};
-      const id = event.frictionId ?? fingerprintSignal(event);
-      const occurrence = {
-        id: event.id,
-        frictionId: id,
-        at: event.at,
-        sessionId: event.sessionId,
-        sessionName: event.sessionName,
-        machineName: event.machineName ?? os.hostname(),
-        workingDirectory: event.workingDirectory,
-        kind: signal.kind ?? "unknown",
-        source: signal.source ?? "unknown",
-        severity: signal.severity ?? "medium",
-        title: signal.title ?? "Friction captured",
-        summary: signal.summary ?? "",
-        tags: signal.tags ?? [],
-        evidence: signal.evidence ?? {}
-      };
+      const occurrence = occurrenceFromSignal(event);
+      const id = occurrence.frictionId;
       occurrences.push(occurrence);
       const existing = items.get(id);
       if (existing) {
@@ -507,15 +491,61 @@ export function buildCatalog(events, options = {}) {
     item.updatedAt = update.at;
   }
 
+  const occurrencesByRecency = [...occurrences].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  for (const occurrence of occurrencesByRecency) {
+    const item = items.get(occurrence.frictionId);
+    if (item && item.latestOccurrence === undefined) {
+      item.latestOccurrence = occurrence;
+    }
+  }
+
   return {
     version: CATALOG_VERSION,
     generatedAt,
     generationId,
     sourceEventLogBytes,
     sourceEventLogMtimeMs,
-    items: [...items.values()].sort(sortItems),
-    occurrences: occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)))
+    items: [...items.values()].sort(sortItems)
   };
+}
+
+function occurrenceFromSignal(event) {
+  const signal = event.signal ?? {};
+  const frictionId = event.frictionId ?? fingerprintSignal(event);
+  return {
+    id: event.id,
+    frictionId,
+    at: event.at,
+    sessionId: event.sessionId,
+    sessionName: event.sessionName,
+    machineName: event.machineName ?? os.hostname(),
+    workingDirectory: event.workingDirectory,
+    kind: signal.kind ?? "unknown",
+    source: signal.source ?? "unknown",
+    severity: signal.severity ?? "medium",
+    title: signal.title ?? "Friction captured",
+    summary: signal.summary ?? "",
+    tags: signal.tags ?? [],
+    evidence: signal.evidence ?? {}
+  };
+}
+
+function buildOccurrences(events) {
+  const occurrences = [];
+  for (const event of events) {
+    if (event.type === "friction.signal") {
+      occurrences.push(occurrenceFromSignal(event));
+    }
+  }
+  return occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+export async function readOccurrencesForId(id, options = {}) {
+  const occurrences = buildOccurrences(await readEvents(options));
+  if (id === undefined) {
+    return occurrences;
+  }
+  return occurrences.filter((occurrence) => occurrence.frictionId === id);
 }
 
 export function pathsForStore(root = defaultStoreRoot()) {
@@ -739,13 +769,6 @@ function buildActiveProjection(catalog) {
       statusCounts[item.status] += 1;
     }
   }
-  const activeIds = new Set(items.map((item) => item.id));
-  const occurrences = [];
-  for (const occurrence of catalog.occurrences ?? []) {
-    if (activeIds.has(occurrence.frictionId)) {
-      occurrences.push({ ...occurrence });
-    }
-  }
   return {
     version: catalog.version,
     generatedAt: catalog.generatedAt,
@@ -753,7 +776,6 @@ function buildActiveProjection(catalog) {
     sourceEventLogBytes: catalog.sourceEventLogBytes,
     sourceEventLogMtimeMs: catalog.sourceEventLogMtimeMs,
     items: items.map((item) => ({ ...item })),
-    occurrences,
     statusCounts
   };
 }

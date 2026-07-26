@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rm, mkdtemp, writeFile } from "node:fs/promises";
+import { rm, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createGreaseTools } from "../.github/extensions/grease/core/tools.mjs";
@@ -31,6 +31,36 @@ test("grease pr1 decouple capture: grease_capture and grease_update preserve eve
     assert.deepEqual(Object.keys(update.data).sort(), ["eventId", "itemCount"]);
     assert.equal(typeof update.data.eventId, "string");
     assert.equal(update.data.itemCount, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr2 bounded projection: grease_get returns reconstructed occurrence evidence at version 6", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    await callTool(tools.get("grease_capture"), {
+      title: "PR2 bounded projection",
+      summary: "Occurrences reconstructed from the append-only log",
+      severity: "medium",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "PR2 evidence"
+    });
+
+    const paths = pathsForStore(root);
+    const catalogFile = JSON.parse(await readFile(paths.catalog, "utf8"));
+    assert.equal(catalogFile.version, 6, "pr2: catalog.json must be version 6");
+    assert.equal(catalogFile.occurrences, undefined, "pr2: catalog.json must omit occurrences[]");
+
+    const { items } = await searchCatalog({ query: "PR2 bounded" }, { root });
+    assert.equal(items.length, 1);
+    const get = await callTool(tools.get("grease_get"), { id: items[0].id });
+    assert.equal(get.data.item.id, items[0].id);
+    assert.ok(Array.isArray(get.data.occurrences));
+    assert.equal(get.data.occurrences.length, 1);
+    assert.ok(get.data.item.latestOccurrence, "pr2: item carries latestOccurrence");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

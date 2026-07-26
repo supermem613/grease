@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as catalogStore from "../.github/extensions/grease/core/catalog.mjs";
-import { appendEvent, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
+import { appendEvent, buildCatalog, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
+import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
 test("grease pr1 decouple capture: append leaves projections byte-identical and first stale read repairs", async () => {
@@ -51,8 +52,94 @@ test("grease pr1 decouple capture: append leaves projections byte-identical and 
 
     const repaired = await readCatalog({ root });
     assert.equal(repaired.items.length, 2);
-    assert.equal(repaired.occurrences.length, 2);
+    assert.equal(repaired.occurrences, undefined, "pr2: catalog projection no longer persists occurrences[]");
+    const repairedReconstruction = await getFriction(repaired.items[0].id, { root });
+    assert.equal(repairedReconstruction.occurrences.length, 1);
     assert.notEqual(seed.event.id, appended.event.id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr2 bounded projection: occurrences reconstructed from log and version-5 projection rebuilds to version 6", async () => {
+  const root = await tempRoot();
+  try {
+    const [firstSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr2-bounded",
+      error: "Bounded projection"
+    }, {
+      sessionId: "pr2-session-1",
+      sessionName: "PR2 First",
+      workingDirectory: "C:\\repo"
+    });
+    const [secondSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr2-bounded",
+      error: "Bounded projection"
+    }, {
+      sessionId: "pr2-session-2",
+      sessionName: "PR2 Second",
+      workingDirectory: "C:\\repo"
+    });
+    firstSignal.at = "2026-06-09T12:00:00.000Z";
+    secondSignal.at = "2026-06-09T12:01:00.000Z";
+    await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "box-1" });
+    await appendEvent(secondSignal, { root, now: "2026-06-09T12:01:00.000Z", machineName: "box-2" });
+
+    const paths = pathsForStore(root);
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.version, 6, "pr2: CATALOG_VERSION must be 6");
+    assert.equal(catalog.occurrences, undefined, "pr2: in-memory catalog omits occurrences[]");
+
+    const catalogFile = JSON.parse(await readFile(paths.catalog, "utf8"));
+    assert.equal(catalogFile.version, 6);
+    assert.equal(catalogFile.occurrences, undefined, "pr2: catalog.json must omit occurrences[]");
+
+    const activeFile = JSON.parse(await readFile(path.join(root, "active.json"), "utf8"));
+    assert.equal(activeFile.version, 6);
+    assert.equal(activeFile.occurrences, undefined, "pr2: active.json must omit occurrences[]");
+
+    const item = catalog.items[0];
+    assert.equal(item.occurrenceCount, 2);
+    assert.ok(item.latestOccurrence, "pr2: item carries latestOccurrence");
+    assert.equal(item.latestOccurrence.machineName, "box-2");
+
+    const got = await getFriction(item.id, { root });
+    assert.equal(got.occurrences.length, 2);
+    assert.equal(got.occurrences[0].machineName, "box-2");
+    assert.equal(got.occurrences[1].machineName, "box-1");
+
+    const brief = await buildBrief({ query: "box-2" }, { root });
+    assert.match(brief.prompt, /occurrences: 2/);
+    assert.match(brief.prompt, /latest working directory: C:\\repo/);
+
+    const staleVersionFiveCatalog = { ...catalogFile, version: 5, occurrences: [{ frictionId: item.id, at: item.latestOccurrence.at }] };
+    await writeFile(paths.catalog, JSON.stringify(staleVersionFiveCatalog, null, 2), "utf8");
+    const rebuilt = await readCatalog({ root });
+    assert.equal(rebuilt.version, 6, "pr2: a version-5 projection rebuilds to version 6");
+    const rebuiltFile = JSON.parse(await readFile(paths.catalog, "utf8"));
+    assert.equal(rebuiltFile.version, 6);
+    assert.equal(rebuiltFile.occurrences, undefined);
+
+    const replay = buildCatalog([
+      { type: "friction.update", at: "2026-06-09T13:00:00.000Z", itemId: "pr2-pinned", updates: { status: "resolved" } },
+      {
+        type: "friction.signal",
+        id: "pr2-signal-event",
+        frictionId: "pr2-pinned",
+        at: "2026-06-09T12:30:00.000Z",
+        sessionId: "pr2-session-replay",
+        sessionName: "PR2 Replay",
+        machineName: "box-replay",
+        workingDirectory: "C:\\repo",
+        signal: { kind: "tool-failure", source: "test", severity: "medium", title: "Replay pinned", summary: "Replay" }
+      }
+    ]);
+    assert.equal(replay.occurrences, undefined, "pr2: buildCatalog no longer returns occurrences[]");
+    const pinned = replay.items.find((candidate) => candidate.id === "pr2-pinned");
+    assert.equal(pinned.status, "resolved", "pr2: update-before-signal applies retroactively");
+    assert.ok(pinned.latestOccurrence, "pr2: replayed item carries latestOccurrence");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -96,9 +183,13 @@ test("append-only log is source of truth for compacted catalog", async () => {
     assert.deepEqual(catalog.items[0].machineNames, ["devbox-1", "devbox-2"]);
     assert.deepEqual(catalog.items[0].sessionNames, ["First session", "Second session"]);
     assert.equal(catalog.items[0].origins.length, 2);
-    assert.equal(catalog.occurrences[0].machineName, "devbox-2");
-    assert.equal(catalog.occurrences[0].sessionName, "Second session");
-    assert.equal(catalog.occurrences.length, 2);
+    assert.equal(catalog.occurrences, undefined, "pr2: catalog projection no longer persists occurrences[]");
+    assert.equal(catalog.items[0].latestOccurrence.machineName, "devbox-2");
+    assert.equal(catalog.items[0].latestOccurrence.sessionName, "Second session");
+    const reconstructed = await getFriction(catalog.items[0].id, { root });
+    assert.equal(reconstructed.occurrences.length, 2);
+    assert.equal(reconstructed.occurrences[0].machineName, "devbox-2");
+    assert.equal(reconstructed.occurrences[0].sessionName, "Second session");
     const machineSearch = await searchCatalog({ query: "devbox-2" }, { root });
     assert.equal(machineSearch.items.length, 1);
     const sessionSearch = await searchCatalog({ query: "Second session" }, { root });
@@ -227,9 +318,18 @@ test("active projection contains only actionable items and shares generation met
     const activeProjection = await catalogStore.readActiveCatalog({ root });
     assert.equal(activeProjection.path, path.join(root, "active.json"));
     assert.deepEqual(activeProjection.items.map((item) => item.id).sort(), [openId, triagedId, inProgressId].sort());
-    assert.equal(activeProjection.occurrences.length, 4);
-    assert.equal(activeProjection.occurrences.filter((occurrence) => occurrence.frictionId === openId).length, 2);
-    assert.deepEqual(activeProjection.occurrences.map((occurrence) => occurrence.frictionId).sort(), [openId, openId, triagedId, inProgressId].sort());
+    assert.equal(activeProjection.occurrences, undefined, "pr2: active projection no longer persists occurrences[]");
+    assert.ok(activeProjection.items.every((item) => item.latestOccurrence), "pr2: active items carry latestOccurrence");
+    const reconstructedActiveFrictionIds = [];
+    for (const activeItem of activeProjection.items) {
+      const { occurrences } = await getFriction(activeItem.id, { root });
+      for (const occurrence of occurrences) {
+        reconstructedActiveFrictionIds.push(occurrence.frictionId);
+      }
+    }
+    assert.equal(reconstructedActiveFrictionIds.length, 4);
+    assert.equal(reconstructedActiveFrictionIds.filter((frictionId) => frictionId === openId).length, 2);
+    assert.deepEqual(reconstructedActiveFrictionIds.sort(), [openId, openId, triagedId, inProgressId].sort());
     assert.deepEqual(activeProjection.statusCounts, {
       open: 1,
       triaged: 1,
