@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
-import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -13,6 +13,8 @@ const FILE_REPLACE_TIMEOUT_MS = 2_000;
 const storeWriteQueues = new Map();
 const disabledActiveProjectionRoots = new Set();
 const PROCESS_START_TIME_MS = Date.now() - Math.floor(process.uptime() * 1000);
+const CATALOG_TEMP_PATTERN = /^catalog\.json\.\d+\.\d+\.\d+\.tmp$/;
+const ACTIVE_TEMP_PATTERN = /^active\.json\.\d+\.\d+\.\d+\.tmp$/;
 let atomicWriteId = 0;
 
 export function defaultStoreRoot() {
@@ -679,10 +681,35 @@ function enqueueStoreWrite(root, operation) {
 async function withStoreLock(root, operation) {
   const release = await acquireStoreLock(root);
   try {
+    await sweepOrphanTempFiles(root);
     return await operation();
   } finally {
     await release();
   }
+}
+
+export async function sweepOrphanTempFiles(root) {
+  let entries;
+  try {
+    entries = await readdir(root);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const removed = [];
+  for (const name of entries) {
+    // Only the exclusive-lock holder runs this, so any file matching a strict
+    // projection owner-temp pattern is an orphan from a crashed write. The
+    // filename pid is never trusted for liveness; the held lock is the proof.
+    if (!CATALOG_TEMP_PATTERN.test(name) && !ACTIVE_TEMP_PATTERN.test(name)) {
+      continue;
+    }
+    await rm(path.join(root, name), { force: true }).catch(() => undefined);
+    removed.push(name);
+  }
+  return removed;
 }
 
 async function acquireStoreLock(root) {
@@ -761,13 +788,23 @@ export async function releaseStoreLock(lockPath, ownerToken) {
     return;
   }
   const tombstonePath = `${lockPath}.${process.pid}.${atomicWriteId++}.released`;
-  try {
-    await rename(lockPath, tombstonePath);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return;
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await rename(lockPath, tombstonePath);
+      break;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return;
+      }
+      // Windows can transiently refuse a directory rename with EPERM/EBUSY when
+      // another store operation holds a handle on the parent. Retry within a
+      // bound rather than leaking the lock, matching replaceFileWithRetry.
+      if (!isRetryableReplaceError(error) || Date.now() - startedAt > FILE_REPLACE_TIMEOUT_MS) {
+        throw error;
+      }
+      await waitForRetry();
     }
-    throw error;
   }
   await rm(tombstonePath, { recursive: true, force: true });
 }

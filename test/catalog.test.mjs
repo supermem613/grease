@@ -230,6 +230,92 @@ test("grease pr3 lock ownership: non-owner release cannot delete a reclaimed loc
   }
 });
 
+test("grease pr4 temp sweeper: stray projection tmp removed under lock while unrelated tmp and in-flight write survive", async () => {
+  const root = await tempRoot();
+  const pathExists = async (target) => {
+    try {
+      await stat(target);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  };
+  try {
+    const [firstSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr4-seed",
+      error: "Seed projection"
+    }, {
+      sessionId: "pr4-seed",
+      sessionName: "PR4 Seed",
+      workingDirectory: "C:\\repo"
+    });
+    const seeded = await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const strayCatalogTmp = path.join(root, `catalog.json.${process.pid}.100.0.tmp`);
+    const strayActiveTmp = path.join(root, `active.json.${process.pid}.100.1.tmp`);
+    const unrelatedTmp = path.join(root, "unrelated.tmp");
+    const nonNumericTmp = path.join(root, "catalog.json.notapid.100.0.tmp");
+    const eventsFile = path.join(root, "events.jsonl");
+    await writeFile(strayCatalogTmp, "stray catalog", "utf8");
+    await writeFile(strayActiveTmp, "stray active", "utf8");
+    await writeFile(unrelatedTmp, "keep me", "utf8");
+    await writeFile(nonNumericTmp, "keep me too", "utf8");
+    const eventsBefore = await readFile(eventsFile, "utf8");
+
+    const [followUpSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr4-follow-up",
+      error: "Follow up projection"
+    }, {
+      sessionId: "pr4-follow-up",
+      sessionName: "PR4 Follow Up",
+      workingDirectory: "C:\\repo"
+    });
+    const followUp = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:05:00.000Z" });
+
+    assert.equal(
+      await pathExists(strayCatalogTmp),
+      false,
+      "pr4: expected a lock-owned sweep to remove only orphaned catalog .tmp files, but no sweeper removed the stray tmp"
+    );
+    assert.equal(
+      await pathExists(strayActiveTmp),
+      false,
+      "pr4: expected a lock-owned sweep to remove only orphaned active .tmp files, but no sweeper removed the stray tmp"
+    );
+
+    assert.equal(
+      await pathExists(unrelatedTmp),
+      true,
+      "pr4: an unrelated .tmp file must never be swept"
+    );
+    assert.equal(
+      await pathExists(nonNumericTmp),
+      true,
+      "pr4: the sweep is strict and must not remove a non-owner temp with a non-numeric pid segment"
+    );
+
+    assert.equal(await pathExists(eventsFile), true, "pr4: events.jsonl must never be swept");
+    const eventsAfter = await readFile(eventsFile, "utf8");
+    assert.ok(eventsAfter.startsWith(eventsBefore), "pr4: events.jsonl stays append-only and untouched by the sweep");
+    const events = await readEvents({ root });
+    assert.ok(events.some((event) => event.id === seeded.event.id), "pr4: the seed event survives");
+    assert.ok(events.some((event) => event.id === followUp.event.id), "pr4: the in-flight write is durable");
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.version, 6, "pr4: the in-flight write's projection output survives");
+    assert.ok(catalog.items.length >= 1, "pr4: the sweep leaves a valid rebuilt catalog");
+
+    assert.equal(typeof catalogStore.sweepOrphanTempFiles, "function", "pr4: a lock-owned temp sweeper must exist");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("append-only log is source of truth for compacted catalog", async () => {
   const root = await tempRoot();
   try {
