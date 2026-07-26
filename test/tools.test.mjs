@@ -7,6 +7,35 @@ import { createGreaseTools } from "../.github/extensions/grease/core/tools.mjs";
 import { appendEvent, pathsForStore, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
+test("grease pr1 decouple capture: grease_capture and grease_update preserve eventId and itemCount", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+
+    const capture = await callTool(tools.get("grease_capture"), {
+      title: "Tool output shape regression",
+      summary: "The capture tool should report eventId and itemCount in its output",
+      severity: "medium",
+      kind: "tool-output",
+      source: "test",
+      evidence: "Call the capture and update tools and inspect the returned payload"
+    });
+    assert.deepEqual(Object.keys(capture.data).sort(), ["eventId", "itemCount"]);
+    assert.equal(typeof capture.data.eventId, "string");
+    assert.equal(capture.data.itemCount, 1);
+
+    const update = await callTool(tools.get("grease_update"), {
+      id: capture.data.eventId,
+      status: "resolved"
+    });
+    assert.deepEqual(Object.keys(update.data).sort(), ["eventId", "itemCount"]);
+    assert.equal(typeof update.data.eventId, "string");
+    assert.equal(update.data.itemCount, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("capture tool tells agents when and how to record operational friction", () => {
   const capture = createGreaseTools().find((tool) => tool.name === "grease_capture");
 

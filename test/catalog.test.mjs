@@ -9,6 +9,55 @@ import * as catalogStore from "../.github/extensions/grease/core/catalog.mjs";
 import { appendEvent, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
+test("grease pr1 decouple capture: append leaves projections byte-identical and first stale read repairs", async () => {
+  const root = await tempRoot();
+  try {
+    const [seedSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "capture-seed",
+      error: "Seed projection"
+    }, {
+      sessionId: "session-seed",
+      sessionName: "Seed Session",
+      workingDirectory: "C:\\repo"
+    });
+    const seed = await appendEvent(seedSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const paths = pathsForStore(root);
+    const beforeCatalogBytes = await readFile(paths.catalog, "utf8");
+    const beforeActiveBytes = await readFile(path.join(root, "active.json"), "utf8");
+
+    const [followUpSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "capture-follow-up",
+      error: "Follow up projection"
+    }, {
+      sessionId: "session-follow-up",
+      sessionName: "Follow Up Session",
+      workingDirectory: "C:\\repo"
+    });
+    const appended = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:00:01.000Z" });
+
+    const lines = (await readFile(paths.events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 2);
+    for (const line of lines) {
+      JSON.parse(line);
+    }
+
+    const afterCatalogBytes = await readFile(paths.catalog, "utf8");
+    const afterActiveBytes = await readFile(path.join(root, "active.json"), "utf8");
+    assert.equal(afterCatalogBytes, beforeCatalogBytes, "expected catalog.json/active.json bytes unchanged after append (and stale readCatalog to rebuild), but projections were rewritten on the hot path");
+    assert.equal(afterActiveBytes, beforeActiveBytes, "expected catalog.json/active.json bytes unchanged after append (and stale readCatalog to rebuild), but projections were rewritten on the hot path");
+
+    const repaired = await readCatalog({ root });
+    assert.equal(repaired.items.length, 2);
+    assert.equal(repaired.occurrences.length, 2);
+    assert.notEqual(seed.event.id, appended.event.id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("append-only log is source of truth for compacted catalog", async () => {
   const root = await tempRoot();
   try {
@@ -33,9 +82,11 @@ test("append-only log is source of truth for compacted catalog", async () => {
       workingDirectory: "C:\\repo"
     });
 
+    first.at = "2026-06-09T12:00:00.000Z";
+    second.at = "2026-06-09T12:01:00.000Z";
+
     await appendEvent(first, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
     await appendEvent(second, { root, now: "2026-06-09T12:01:00.000Z", machineName: "devbox-2" });
-
     const events = await readEvents({ root });
     const catalog = await readCatalog({ root });
 

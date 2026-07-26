@@ -24,8 +24,8 @@ export async function appendEvent(event, options = {}) {
     await ensureStore(root);
     const normalized = normalizeEvent(event, options);
     await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
-    const catalog = await rebuildCatalogUnlocked(root);
-    return { event: normalized, catalog };
+    await bootstrapCatalogProjection(root);
+    return { event: normalized };
   });
 }
 
@@ -73,21 +73,32 @@ async function rebuildCatalogUnlocked(root) {
   return catalog;
 }
 
+async function bootstrapCatalogProjection(root) {
+  try {
+    await stat(catalogPath(root));
+    return;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  await rebuildCatalogUnlocked(root);
+}
+
 export async function readCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
   await ensureStore(root);
-  try {
-    const catalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
-    if (catalog.version !== CATALOG_VERSION) {
-      return rebuildCatalog({ root });
-    }
-    return catalog;
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return rebuildCatalog({ root });
-    }
-    throw error;
+  const validation = await validateCatalogProjection(root);
+  if (validation.valid) {
+    return validation.catalog;
   }
+  return enqueueStoreWrite(root, async () => {
+    const lockedValidation = await validateCatalogProjection(root);
+    if (lockedValidation.valid) {
+      return lockedValidation.catalog;
+    }
+    return rebuildCatalogUnlocked(root);
+  });
 }
 
 export async function readActiveCatalog(options = {}) {
@@ -182,6 +193,37 @@ async function validateActiveProjection(root, activeFilePath, options = {}) {
     valid: true,
     projection: { ...active, path: activeFilePath }
   };
+}
+
+async function validateCatalogProjection(root) {
+  let catalog;
+  try {
+    catalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) {
+      return { valid: false };
+    }
+    throw error;
+  }
+  if (catalog.version !== CATALOG_VERSION) {
+    return { valid: false };
+  }
+  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
+  let expectedGenerationId;
+  try {
+    expectedGenerationId = await deriveGenerationId(root, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return { valid: false };
+    }
+    throw error;
+  }
+  if (catalog.sourceEventLogBytes !== sourceEventLogMetadata.size ||
+      catalog.sourceEventLogMtimeMs !== sourceEventLogMetadata.mtimeMs ||
+      catalog.generationId !== expectedGenerationId) {
+    return { valid: false };
+  }
+  return { valid: true, catalog };
 }
 
 async function readActiveProjectionFile(root, activeFilePath) {
@@ -345,7 +387,9 @@ export async function updateFriction(id, updates, options = {}) {
     itemId: id,
     updates: allowed
   };
-  return appendEvent(event, options);
+  const result = await appendEvent(event, options);
+  const catalog = await readCatalog(options);
+  return { event: result.event, catalog };
 }
 
 export async function updateFrictionBulk(ids, updates, options = {}) {
@@ -355,7 +399,7 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
   const allowed = normalizeFrictionUpdates(updates);
   const root = options.root ?? defaultStoreRoot();
   const at = options.now ?? new Date().toISOString();
-  return enqueueStoreWrite(root, async () => {
+  await enqueueStoreWrite(root, async () => {
     await ensureStore(root);
     for (const id of ids) {
       if (!id) {
@@ -369,9 +413,10 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
       }, options);
       await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
     }
-    const catalog = await rebuildCatalogUnlocked(root);
-    return { ids, catalog };
+    await bootstrapCatalogProjection(root);
   });
+  const catalog = await readCatalog({ ...options, root });
+  return { ids, catalog };
 }
 
 export function buildCatalog(events, options = {}) {
