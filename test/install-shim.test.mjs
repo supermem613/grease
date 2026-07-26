@@ -7,14 +7,16 @@ import path from "node:path";
 
 test("install shim writes a file URL import", async () => {
   const target = await mkdtemp(path.join(os.tmpdir(), "grease-shim-"));
+  const skillsTarget = await mkdtemp(path.join(os.tmpdir(), "grease-skills-"));
   try {
-    const result = await runNode(["scripts/install-extension-shim.mjs", "--target", target]);
+    const result = await runNode(["scripts/install-extension-shim.mjs", "--target", target, "--skills-target", skillsTarget]);
     assert.equal(result.ok, true);
     const shim = await readFile(path.join(target, "extension.mjs"), "utf8");
     assert.match(shim, /^await import\("file:\/\/\//);
     assert.match(shim, /extension\.mjs"\);/);
   } finally {
     await rm(target, { recursive: true, force: true });
+    await rm(skillsTarget, { recursive: true, force: true });
   }
 });
 
