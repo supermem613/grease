@@ -250,15 +250,33 @@ test("grease pr5 split locks: capture proceeds during rebuild and concurrent sta
     }
     await readCatalog({ root });
 
-    const order = [];
-    const rebuildPromise = catalogStore.rebuildCatalog({ root }).then(() => order.push("rebuild"));
-    const capturePromise = appendEvent(signalFor(60), { root, now: "2026-06-09T13:00:00.000Z" }).then(() => order.push("capture"));
-    await Promise.all([rebuildPromise, capturePromise]);
-    assert.deepEqual(
-      order,
-      ["capture", "rebuild"],
+    // Hold the projection lock with a live owner. A capture that shared the
+    // projection lock would spin until the store lock timeout and throw, so
+    // this proves lock independence without racing on how fast a host rebuilds.
+    const projectionLock = path.join(root, "catalog.lock");
+    await mkdir(projectionLock);
+    await writeFile(
+      path.join(projectionLock, "owner.json"),
+      `${JSON.stringify(catalogStore.buildStoreLockOwner(), null, 2)}\n`,
+      "utf8"
+    );
+    let capturedDuringRebuild;
+    try {
+      capturedDuringRebuild = await appendEvent(signalFor(60), { root, now: "2026-06-09T13:00:00.000Z" });
+    } finally {
+      await rm(projectionLock, { recursive: true, force: true });
+    }
+    assert.ok(
+      capturedDuringRebuild?.event?.id,
       "pr5: expected split append/projection locks, but capture blocked on projection rebuild work"
     );
+    const eventsDuringRebuild = await readEvents({ root });
+    assert.ok(
+      eventsDuringRebuild.some((event) => event.id === capturedDuringRebuild.event.id),
+      "pr5: the capture taken while projection work held its lock is durable in the event log"
+    );
+
+    await catalogStore.rebuildCatalog({ root });
 
     await appendEvent(signalFor(61), { root, now: "2026-06-09T13:01:00.000Z" });
     const [firstReader, secondReader] = await Promise.all([
