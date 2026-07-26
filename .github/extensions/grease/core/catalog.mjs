@@ -10,7 +10,8 @@ const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
 const STORE_LOCK_GRACE_MS = 5_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
-const storeWriteQueues = new Map();
+const projectionWriteQueues = new Map();
+const appendWriteQueues = new Map();
 const disabledActiveProjectionRoots = new Set();
 const PROCESS_START_TIME_MS = Date.now() - Math.floor(process.uptime() * 1000);
 const CATALOG_TEMP_PATTERN = /^catalog\.json\.\d+\.\d+\.\d+\.tmp$/;
@@ -23,13 +24,14 @@ export function defaultStoreRoot() {
 
 export async function appendEvent(event, options = {}) {
   const root = options.root ?? defaultStoreRoot();
-  return enqueueStoreWrite(root, async () => {
+  const normalized = await enqueueAppendWrite(root, async () => {
     await ensureStore(root);
-    const normalized = normalizeEvent(event, options);
-    await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
-    await bootstrapCatalogProjection(root);
-    return { event: normalized };
+    const entry = normalizeEvent(event, options);
+    await appendFile(eventsPath(root), `${JSON.stringify(entry)}\n`, "utf8");
+    return entry;
   });
+  await maintainProjectionAfterAppend(root);
+  return { event: normalized };
 }
 
 export async function readEvents(options = {}) {
@@ -56,36 +58,89 @@ export async function readEvents(options = {}) {
 
 export async function rebuildCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
-  return enqueueStoreWrite(root, () => rebuildCatalogUnlocked(root));
+  return enqueueProjectionWrite(root, () => rebuildCatalogUnlocked(root));
 }
 
 async function rebuildCatalogUnlocked(root) {
   await ensureStore(root);
-  const events = await readEvents({ root });
-  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
-  const generationId = buildGenerationId(events, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  const boundary = await captureEventLogBoundary(root);
+  const generationId = buildGenerationId(boundary.events, boundary.size, boundary.mtimeMs);
   const generatedAt = new Date().toISOString();
-  const catalog = buildCatalog(events, {
+  const catalog = buildCatalog(boundary.events, {
     generatedAt,
     generationId,
-    sourceEventLogBytes: sourceEventLogMetadata.size,
-    sourceEventLogMtimeMs: sourceEventLogMetadata.mtimeMs
+    sourceEventLogBytes: boundary.size,
+    sourceEventLogMtimeMs: boundary.mtimeMs
   });
   const active = buildActiveProjection(catalog);
   await writeJsonFilesAtomic(root, catalog, active);
   return catalog;
 }
 
-async function bootstrapCatalogProjection(root) {
-  try {
-    await stat(catalogPath(root));
+async function maintainProjectionAfterAppend(root) {
+  // Capture never waits on projection work. Take the projection lock only if it
+  // is free. If a rebuild or repair already holds it, that holder sweeps temps
+  // and refreshes the projection, so this append returns without blocking.
+  const release = await tryAcquireProjectionLock(root);
+  if (!release) {
     return;
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
   }
-  await rebuildCatalogUnlocked(root);
+  try {
+    await sweepOrphanTempFiles(root);
+    try {
+      await stat(catalogPath(root));
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      await rebuildCatalogUnlocked(root);
+    }
+  } finally {
+    await release();
+  }
+}
+
+async function captureEventLogBoundary(root) {
+  let handle;
+  try {
+    handle = await open(eventsPath(root), "r");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { events: [], size: 0, mtimeMs: 0 };
+    }
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    const buffer = Buffer.alloc(info.size);
+    if (info.size > 0) {
+      await handle.read(buffer, 0, info.size, 0);
+    }
+    // The rebuild is pinned to this captured byte offset and identity. Appends
+    // that land after the boundary grow the file past info.size and are ignored
+    // here, so the published generation stays internally consistent.
+    return { events: parseEventLogBuffer(buffer), size: info.size, mtimeMs: info.mtimeMs };
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseEventLogBuffer(buffer) {
+  const lines = buffer.toString("utf8").split("\n");
+  // A trailing segment without a newline is a partial append past the captured
+  // boundary and must not be parsed as a complete event.
+  if (lines.length > 0 && lines[lines.length - 1] !== "") {
+    lines.pop();
+  }
+  const events = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, "");
+    if (line.trim() === "") {
+      continue;
+    }
+    events.push(JSON.parse(line));
+  }
+  return events;
 }
 
 export async function readCatalog(options = {}) {
@@ -95,7 +150,7 @@ export async function readCatalog(options = {}) {
   if (validation.valid) {
     return validation.catalog;
   }
-  return enqueueStoreWrite(root, async () => {
+  return enqueueProjectionWrite(root, async () => {
     const lockedValidation = await validateCatalogProjection(root);
     if (lockedValidation.valid) {
       return lockedValidation.catalog;
@@ -127,7 +182,7 @@ export async function readActiveCatalog(options = {}) {
     return initialValidation.projection;
   }
 
-  return enqueueStoreWrite(root, async () => {
+  return enqueueProjectionWrite(root, async () => {
     let lockedValidation;
     try {
       lockedValidation = await validateActiveProjection(root, activeFilePath, { strict: true });
@@ -402,7 +457,7 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
   const allowed = normalizeFrictionUpdates(updates);
   const root = options.root ?? defaultStoreRoot();
   const at = options.now ?? new Date().toISOString();
-  await enqueueStoreWrite(root, async () => {
+  await enqueueAppendWrite(root, async () => {
     await ensureStore(root);
     for (const id of ids) {
       if (!id) {
@@ -416,8 +471,8 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
       }, options);
       await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
     }
-    await bootstrapCatalogProjection(root);
   });
+  await maintainProjectionAfterAppend(root);
   const catalog = await readCatalog({ ...options, root });
   return { ids, catalog };
 }
@@ -617,6 +672,10 @@ function storeLockPath(root) {
   return path.join(root, "catalog.lock");
 }
 
+function appendLockPath(root) {
+  return path.join(root, "append.lock");
+}
+
 async function writeJsonFilesAtomic(root, catalog, active) {
   const resolvedRoot = path.resolve(root);
   const catalogTempPath = `${catalogPath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
@@ -666,22 +725,39 @@ async function readActiveCatalogFallback(root, activeFilePath) {
   return { ...buildActiveProjection(catalog), path: activeFilePath };
 }
 
-function enqueueStoreWrite(root, operation) {
-  const previous = storeWriteQueues.get(root) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(() => withStoreLock(root, operation));
+function enqueueSerial(queues, root, operation) {
+  const previous = queues.get(root) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => operation());
   const tracked = next.finally(() => {
-    if (storeWriteQueues.get(root) === tracked) {
-      storeWriteQueues.delete(root);
+    if (queues.get(root) === tracked) {
+      queues.delete(root);
     }
   });
-  storeWriteQueues.set(root, tracked);
+  queues.set(root, tracked);
   return next;
 }
 
-async function withStoreLock(root, operation) {
-  const release = await acquireStoreLock(root);
+function enqueueProjectionWrite(root, operation) {
+  return enqueueSerial(projectionWriteQueues, root, () => withProjectionLock(root, operation));
+}
+
+function enqueueAppendWrite(root, operation) {
+  return enqueueSerial(appendWriteQueues, root, () => withAppendLock(root, operation));
+}
+
+async function withProjectionLock(root, operation) {
+  const release = await acquireLock(root, storeLockPath(root));
   try {
     await sweepOrphanTempFiles(root);
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
+export async function withAppendLock(root, operation) {
+  const release = await acquireLock(root, appendLockPath(root));
+  try {
     return await operation();
   } finally {
     await release();
@@ -712,9 +788,8 @@ export async function sweepOrphanTempFiles(root) {
   return removed;
 }
 
-async function acquireStoreLock(root) {
+async function acquireLock(root, lockPath) {
   await mkdir(root, { recursive: true });
-  const lockPath = storeLockPath(root);
   const owner = buildStoreLockOwner();
   const startedAt = Date.now();
   while (true) {
@@ -733,6 +808,27 @@ async function acquireStoreLock(root) {
       await waitForRetry();
     }
   }
+}
+
+async function tryAcquireProjectionLock(root) {
+  await mkdir(root, { recursive: true });
+  const lockPath = storeLockPath(root);
+  const owner = buildStoreLockOwner();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
+      return () => releaseStoreLock(lockPath, owner.token);
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      // A live holder owns the projection lock, so never wait. Reclaim only a
+      // provably abandoned lock, then retry the claim exactly once.
+      await reclaimAbandonedLock(lockPath);
+    }
+  }
+  return undefined;
 }
 
 export function buildStoreLockOwner() {

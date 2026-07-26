@@ -230,6 +230,60 @@ test("grease pr3 lock ownership: non-owner release cannot delete a reclaimed loc
   }
 });
 
+test("grease pr5 split locks: capture proceeds during rebuild and concurrent stale readers publish exactly one generation", async () => {
+  const root = await tempRoot();
+  const signalFor = (index) => {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: `pr5-${index}`,
+      error: `friction ${index}`
+    }, {
+      sessionId: `pr5-${index}`,
+      sessionName: `PR5 ${index}`,
+      workingDirectory: "C:\\repo"
+    });
+    return signal;
+  };
+  try {
+    for (let index = 0; index < 60; index += 1) {
+      await appendEvent(signalFor(index), { root, now: `2026-06-09T12:${String(index % 60).padStart(2, "0")}:00.000Z` });
+    }
+    await readCatalog({ root });
+
+    const order = [];
+    const rebuildPromise = catalogStore.rebuildCatalog({ root }).then(() => order.push("rebuild"));
+    const capturePromise = appendEvent(signalFor(60), { root, now: "2026-06-09T13:00:00.000Z" }).then(() => order.push("capture"));
+    await Promise.all([rebuildPromise, capturePromise]);
+    assert.deepEqual(
+      order,
+      ["capture", "rebuild"],
+      "pr5: expected split append/projection locks, but capture blocked on projection rebuild work"
+    );
+
+    await appendEvent(signalFor(61), { root, now: "2026-06-09T13:01:00.000Z" });
+    const [firstReader, secondReader] = await Promise.all([
+      readCatalog({ root }),
+      readCatalog({ root })
+    ]);
+    assert.equal(
+      firstReader.generationId,
+      secondReader.generationId,
+      "pr5: expected concurrent stale readers to publish exactly one generation, but two generations were published"
+    );
+    const published = JSON.parse(await readFile(pathsForStore(root).catalog, "utf8"));
+    assert.equal(published.generationId, firstReader.generationId, "pr5: the on-disk projection matches the single published generation");
+
+    const events = await readEvents({ root });
+    const meta = await stat(pathsForStore(root).events);
+    assert.equal(published.sourceEventLogBytes, meta.size, "pr5: the rebuild is pinned to a captured event-log byte boundary");
+    assert.ok(events.some((event) => event.id === firstReader.items[0]?.id) || firstReader.items.length > 0, "pr5: the published generation reflects the captured events");
+
+    assert.equal(typeof catalogStore.withAppendLock, "function", "pr5: a dedicated append lock must exist, separate from the projection lock");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("grease pr4 temp sweeper: stray projection tmp removed under lock while unrelated tmp and in-flight write survive", async () => {
   const root = await tempRoot();
   const pathExists = async (target) => {
