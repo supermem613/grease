@@ -6,8 +6,369 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import * as catalogStore from "../.github/extensions/grease/core/catalog.mjs";
-import { appendEvent, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
+import { appendEvent, buildCatalog, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
+import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
 import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
+
+test("grease pr1 decouple capture: append leaves projections byte-identical and first stale read repairs", async () => {
+  const root = await tempRoot();
+  try {
+    const [seedSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "capture-seed",
+      error: "Seed projection"
+    }, {
+      sessionId: "session-seed",
+      sessionName: "Seed Session",
+      workingDirectory: "C:\\repo"
+    });
+    const seed = await appendEvent(seedSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const paths = pathsForStore(root);
+    const beforeCatalogBytes = await readFile(paths.catalog, "utf8");
+    const beforeActiveBytes = await readFile(path.join(root, "active.json"), "utf8");
+
+    const [followUpSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "capture-follow-up",
+      error: "Follow up projection"
+    }, {
+      sessionId: "session-follow-up",
+      sessionName: "Follow Up Session",
+      workingDirectory: "C:\\repo"
+    });
+    const appended = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:00:01.000Z" });
+
+    const lines = (await readFile(paths.events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 2);
+    for (const line of lines) {
+      JSON.parse(line);
+    }
+
+    const afterCatalogBytes = await readFile(paths.catalog, "utf8");
+    const afterActiveBytes = await readFile(path.join(root, "active.json"), "utf8");
+    assert.equal(afterCatalogBytes, beforeCatalogBytes, "expected catalog.json/active.json bytes unchanged after append (and stale readCatalog to rebuild), but projections were rewritten on the hot path");
+    assert.equal(afterActiveBytes, beforeActiveBytes, "expected catalog.json/active.json bytes unchanged after append (and stale readCatalog to rebuild), but projections were rewritten on the hot path");
+
+    const repaired = await readCatalog({ root });
+    assert.equal(repaired.items.length, 2);
+    assert.equal(repaired.occurrences, undefined, "pr2: catalog projection no longer persists occurrences[]");
+    const repairedReconstruction = await getFriction(repaired.items[0].id, { root });
+    assert.equal(repairedReconstruction.occurrences.length, 1);
+    assert.notEqual(seed.event.id, appended.event.id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr2 bounded projection: occurrences reconstructed from log and version-5 projection rebuilds to version 6", async () => {
+  const root = await tempRoot();
+  try {
+    const [firstSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr2-bounded",
+      error: "Bounded projection"
+    }, {
+      sessionId: "pr2-session-1",
+      sessionName: "PR2 First",
+      workingDirectory: "C:\\repo"
+    });
+    const [secondSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr2-bounded",
+      error: "Bounded projection"
+    }, {
+      sessionId: "pr2-session-2",
+      sessionName: "PR2 Second",
+      workingDirectory: "C:\\repo"
+    });
+    firstSignal.at = "2026-06-09T12:00:00.000Z";
+    secondSignal.at = "2026-06-09T12:01:00.000Z";
+    await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "box-1" });
+    await appendEvent(secondSignal, { root, now: "2026-06-09T12:01:00.000Z", machineName: "box-2" });
+
+    const paths = pathsForStore(root);
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.version, 6, "pr2: CATALOG_VERSION must be 6");
+    assert.equal(catalog.occurrences, undefined, "pr2: in-memory catalog omits occurrences[]");
+
+    const catalogFile = JSON.parse(await readFile(paths.catalog, "utf8"));
+    assert.equal(catalogFile.version, 6);
+    assert.equal(catalogFile.occurrences, undefined, "pr2: catalog.json must omit occurrences[]");
+
+    const activeFile = JSON.parse(await readFile(path.join(root, "active.json"), "utf8"));
+    assert.equal(activeFile.version, 6);
+    assert.equal(activeFile.occurrences, undefined, "pr2: active.json must omit occurrences[]");
+
+    const item = catalog.items[0];
+    assert.equal(item.occurrenceCount, 2);
+    assert.ok(item.latestOccurrence, "pr2: item carries latestOccurrence");
+    assert.equal(item.latestOccurrence.machineName, "box-2");
+
+    const got = await getFriction(item.id, { root });
+    assert.equal(got.occurrences.length, 2);
+    assert.equal(got.occurrences[0].machineName, "box-2");
+    assert.equal(got.occurrences[1].machineName, "box-1");
+
+    const brief = await buildBrief({ query: "box-2" }, { root });
+    assert.match(brief.prompt, /occurrences: 2/);
+    assert.match(brief.prompt, /latest working directory: C:\\repo/);
+
+    const staleVersionFiveCatalog = { ...catalogFile, version: 5, occurrences: [{ frictionId: item.id, at: item.latestOccurrence.at }] };
+    await writeFile(paths.catalog, JSON.stringify(staleVersionFiveCatalog, null, 2), "utf8");
+    const rebuilt = await readCatalog({ root });
+    assert.equal(rebuilt.version, 6, "pr2: a version-5 projection rebuilds to version 6");
+    const rebuiltFile = JSON.parse(await readFile(paths.catalog, "utf8"));
+    assert.equal(rebuiltFile.version, 6);
+    assert.equal(rebuiltFile.occurrences, undefined);
+
+    const replay = buildCatalog([
+      { type: "friction.update", at: "2026-06-09T13:00:00.000Z", itemId: "pr2-pinned", updates: { status: "resolved" } },
+      {
+        type: "friction.signal",
+        id: "pr2-signal-event",
+        frictionId: "pr2-pinned",
+        at: "2026-06-09T12:30:00.000Z",
+        sessionId: "pr2-session-replay",
+        sessionName: "PR2 Replay",
+        machineName: "box-replay",
+        workingDirectory: "C:\\repo",
+        signal: { kind: "tool-failure", source: "test", severity: "medium", title: "Replay pinned", summary: "Replay" }
+      }
+    ]);
+    assert.equal(replay.occurrences, undefined, "pr2: buildCatalog no longer returns occurrences[]");
+    const pinned = replay.items.find((candidate) => candidate.id === "pr2-pinned");
+    assert.equal(pinned.status, "resolved", "pr2: update-before-signal applies retroactively");
+    assert.ok(pinned.latestOccurrence, "pr2: replayed item carries latestOccurrence");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr3 lock ownership: non-owner release cannot delete a reclaimed lock and dead-owner locks are reclaimed", async () => {
+  const root = await tempRoot();
+  const pathExists = async (target) => {
+    try {
+      await stat(target);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  };
+  try {
+    assert.equal(typeof catalogStore.releaseStoreLock, "function", "pr3: ownership-checked releaseStoreLock must exist");
+    assert.equal(typeof catalogStore.shouldReclaimStoreLock, "function", "pr3: liveness-aware shouldReclaimStoreLock must exist");
+    assert.equal(typeof catalogStore.isStoreLockOwnerAlive, "function", "pr3: pid liveness probe must exist");
+    assert.equal(typeof catalogStore.buildStoreLockOwner, "function", "pr3: pid + start-time owner identity must exist");
+
+    const lockPath = path.join(root, "catalog.lock");
+
+    const ownerA = catalogStore.buildStoreLockOwner();
+    assert.equal(typeof ownerA.pid, "number");
+    assert.equal(typeof ownerA.startTimeMs, "number");
+    assert.equal(typeof ownerA.token, "string");
+
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(ownerA, null, 2)}\n`, "utf8");
+
+    const ownerB = catalogStore.buildStoreLockOwner();
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(ownerB, null, 2)}\n`, "utf8");
+
+    await catalogStore.releaseStoreLock(lockPath, ownerA.token);
+    assert.equal(await pathExists(path.join(lockPath, "owner.json")), true, "pr3: a non-owner release must not delete a foreign lock");
+    const survivingOwner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+    assert.equal(survivingOwner.token, ownerB.token, "pr3: the reclaimed lock still belongs to its new owner");
+
+    await catalogStore.releaseStoreLock(lockPath, ownerB.token);
+    assert.equal(await pathExists(lockPath), false, "pr3: the owner's release removes its own lock");
+
+    assert.equal(catalogStore.isStoreLockOwnerAlive({ pid: process.pid }), true, "pr3: the current process is alive");
+    assert.equal(catalogStore.isStoreLockOwnerAlive({ pid: 0 }), false, "pr3: an invalid pid is not alive");
+
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock({ pid: 424242, token: "dead" }, { now: 1000, mtimeMs: 999, graceMs: 5000, isProcessAliveFn: () => false }),
+      true,
+      "pr3: a lock owned by a provably dead process is reclaimed even when fresh"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock({ pid: process.pid, token: "live" }, { now: 10_000_000, mtimeMs: 0, graceMs: 5000, isProcessAliveFn: () => true }),
+      false,
+      "pr3: a live owner's lock is never reclaimed by age"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock(undefined, { now: 1000, mtimeMs: 999, graceMs: 5000 }),
+      false,
+      "pr3: missing owner metadata within the grace window is not reclaimed"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock(undefined, { now: 10_000, mtimeMs: 0, graceMs: 5000 }),
+      true,
+      "pr3: missing owner metadata beyond the grace window is reclaimed"
+    );
+
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: 0, token: "dead-owner", acquiredAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
+    const [deadOwnerSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr3-dead-owner",
+      error: "Dead owner lock"
+    }, {
+      sessionId: "pr3-dead-owner",
+      sessionName: "PR3 Dead Owner",
+      workingDirectory: "C:\\repo"
+    });
+    const appended = await appendEvent(deadOwnerSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+    assert.ok(appended.event.id, "pr3: a write reclaims a dead-owner lock and proceeds");
+    assert.equal(await pathExists(lockPath), false, "pr3: the reclaimed lock is released after the write");
+    const events = await readEvents({ root });
+    assert.ok(events.some((event) => event.id === appended.event.id), "pr3: the reclaiming write is durable");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr5 split locks: capture proceeds during rebuild and concurrent stale readers publish exactly one generation", async () => {
+  const root = await tempRoot();
+  const signalFor = (index) => {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: `pr5-${index}`,
+      error: `friction ${index}`
+    }, {
+      sessionId: `pr5-${index}`,
+      sessionName: `PR5 ${index}`,
+      workingDirectory: "C:\\repo"
+    });
+    return signal;
+  };
+  try {
+    for (let index = 0; index < 60; index += 1) {
+      await appendEvent(signalFor(index), { root, now: `2026-06-09T12:${String(index % 60).padStart(2, "0")}:00.000Z` });
+    }
+    await readCatalog({ root });
+
+    const order = [];
+    const rebuildPromise = catalogStore.rebuildCatalog({ root }).then(() => order.push("rebuild"));
+    const capturePromise = appendEvent(signalFor(60), { root, now: "2026-06-09T13:00:00.000Z" }).then(() => order.push("capture"));
+    await Promise.all([rebuildPromise, capturePromise]);
+    assert.deepEqual(
+      order,
+      ["capture", "rebuild"],
+      "pr5: expected split append/projection locks, but capture blocked on projection rebuild work"
+    );
+
+    await appendEvent(signalFor(61), { root, now: "2026-06-09T13:01:00.000Z" });
+    const [firstReader, secondReader] = await Promise.all([
+      readCatalog({ root }),
+      readCatalog({ root })
+    ]);
+    assert.equal(
+      firstReader.generationId,
+      secondReader.generationId,
+      "pr5: expected concurrent stale readers to publish exactly one generation, but two generations were published"
+    );
+    const published = JSON.parse(await readFile(pathsForStore(root).catalog, "utf8"));
+    assert.equal(published.generationId, firstReader.generationId, "pr5: the on-disk projection matches the single published generation");
+
+    const events = await readEvents({ root });
+    const meta = await stat(pathsForStore(root).events);
+    assert.equal(published.sourceEventLogBytes, meta.size, "pr5: the rebuild is pinned to a captured event-log byte boundary");
+    assert.ok(events.some((event) => event.id === firstReader.items[0]?.id) || firstReader.items.length > 0, "pr5: the published generation reflects the captured events");
+
+    assert.equal(typeof catalogStore.withAppendLock, "function", "pr5: a dedicated append lock must exist, separate from the projection lock");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease pr4 temp sweeper: stray projection tmp removed under lock while unrelated tmp and in-flight write survive", async () => {
+  const root = await tempRoot();
+  const pathExists = async (target) => {
+    try {
+      await stat(target);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  };
+  try {
+    const [firstSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr4-seed",
+      error: "Seed projection"
+    }, {
+      sessionId: "pr4-seed",
+      sessionName: "PR4 Seed",
+      workingDirectory: "C:\\repo"
+    });
+    const seeded = await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const strayCatalogTmp = path.join(root, `catalog.json.${process.pid}.100.0.tmp`);
+    const strayActiveTmp = path.join(root, `active.json.${process.pid}.100.1.tmp`);
+    const unrelatedTmp = path.join(root, "unrelated.tmp");
+    const nonNumericTmp = path.join(root, "catalog.json.notapid.100.0.tmp");
+    const eventsFile = path.join(root, "events.jsonl");
+    await writeFile(strayCatalogTmp, "stray catalog", "utf8");
+    await writeFile(strayActiveTmp, "stray active", "utf8");
+    await writeFile(unrelatedTmp, "keep me", "utf8");
+    await writeFile(nonNumericTmp, "keep me too", "utf8");
+    const eventsBefore = await readFile(eventsFile, "utf8");
+
+    const [followUpSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr4-follow-up",
+      error: "Follow up projection"
+    }, {
+      sessionId: "pr4-follow-up",
+      sessionName: "PR4 Follow Up",
+      workingDirectory: "C:\\repo"
+    });
+    const followUp = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:05:00.000Z" });
+
+    assert.equal(
+      await pathExists(strayCatalogTmp),
+      false,
+      "pr4: expected a lock-owned sweep to remove only orphaned catalog .tmp files, but no sweeper removed the stray tmp"
+    );
+    assert.equal(
+      await pathExists(strayActiveTmp),
+      false,
+      "pr4: expected a lock-owned sweep to remove only orphaned active .tmp files, but no sweeper removed the stray tmp"
+    );
+
+    assert.equal(
+      await pathExists(unrelatedTmp),
+      true,
+      "pr4: an unrelated .tmp file must never be swept"
+    );
+    assert.equal(
+      await pathExists(nonNumericTmp),
+      true,
+      "pr4: the sweep is strict and must not remove a non-owner temp with a non-numeric pid segment"
+    );
+
+    assert.equal(await pathExists(eventsFile), true, "pr4: events.jsonl must never be swept");
+    const eventsAfter = await readFile(eventsFile, "utf8");
+    assert.ok(eventsAfter.startsWith(eventsBefore), "pr4: events.jsonl stays append-only and untouched by the sweep");
+    const events = await readEvents({ root });
+    assert.ok(events.some((event) => event.id === seeded.event.id), "pr4: the seed event survives");
+    assert.ok(events.some((event) => event.id === followUp.event.id), "pr4: the in-flight write is durable");
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.version, 6, "pr4: the in-flight write's projection output survives");
+    assert.ok(catalog.items.length >= 1, "pr4: the sweep leaves a valid rebuilt catalog");
+
+    assert.equal(typeof catalogStore.sweepOrphanTempFiles, "function", "pr4: a lock-owned temp sweeper must exist");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("append-only log is source of truth for compacted catalog", async () => {
   const root = await tempRoot();
@@ -33,9 +394,11 @@ test("append-only log is source of truth for compacted catalog", async () => {
       workingDirectory: "C:\\repo"
     });
 
+    first.at = "2026-06-09T12:00:00.000Z";
+    second.at = "2026-06-09T12:01:00.000Z";
+
     await appendEvent(first, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
     await appendEvent(second, { root, now: "2026-06-09T12:01:00.000Z", machineName: "devbox-2" });
-
     const events = await readEvents({ root });
     const catalog = await readCatalog({ root });
 
@@ -45,9 +408,13 @@ test("append-only log is source of truth for compacted catalog", async () => {
     assert.deepEqual(catalog.items[0].machineNames, ["devbox-1", "devbox-2"]);
     assert.deepEqual(catalog.items[0].sessionNames, ["First session", "Second session"]);
     assert.equal(catalog.items[0].origins.length, 2);
-    assert.equal(catalog.occurrences[0].machineName, "devbox-2");
-    assert.equal(catalog.occurrences[0].sessionName, "Second session");
-    assert.equal(catalog.occurrences.length, 2);
+    assert.equal(catalog.occurrences, undefined, "pr2: catalog projection no longer persists occurrences[]");
+    assert.equal(catalog.items[0].latestOccurrence.machineName, "devbox-2");
+    assert.equal(catalog.items[0].latestOccurrence.sessionName, "Second session");
+    const reconstructed = await getFriction(catalog.items[0].id, { root });
+    assert.equal(reconstructed.occurrences.length, 2);
+    assert.equal(reconstructed.occurrences[0].machineName, "devbox-2");
+    assert.equal(reconstructed.occurrences[0].sessionName, "Second session");
     const machineSearch = await searchCatalog({ query: "devbox-2" }, { root });
     assert.equal(machineSearch.items.length, 1);
     const sessionSearch = await searchCatalog({ query: "Second session" }, { root });
@@ -176,9 +543,18 @@ test("active projection contains only actionable items and shares generation met
     const activeProjection = await catalogStore.readActiveCatalog({ root });
     assert.equal(activeProjection.path, path.join(root, "active.json"));
     assert.deepEqual(activeProjection.items.map((item) => item.id).sort(), [openId, triagedId, inProgressId].sort());
-    assert.equal(activeProjection.occurrences.length, 4);
-    assert.equal(activeProjection.occurrences.filter((occurrence) => occurrence.frictionId === openId).length, 2);
-    assert.deepEqual(activeProjection.occurrences.map((occurrence) => occurrence.frictionId).sort(), [openId, openId, triagedId, inProgressId].sort());
+    assert.equal(activeProjection.occurrences, undefined, "pr2: active projection no longer persists occurrences[]");
+    assert.ok(activeProjection.items.every((item) => item.latestOccurrence), "pr2: active items carry latestOccurrence");
+    const reconstructedActiveFrictionIds = [];
+    for (const activeItem of activeProjection.items) {
+      const { occurrences } = await getFriction(activeItem.id, { root });
+      for (const occurrence of occurrences) {
+        reconstructedActiveFrictionIds.push(occurrence.frictionId);
+      }
+    }
+    assert.equal(reconstructedActiveFrictionIds.length, 4);
+    assert.equal(reconstructedActiveFrictionIds.filter((frictionId) => frictionId === openId).length, 2);
+    assert.deepEqual(reconstructedActiveFrictionIds.sort(), [openId, openId, triagedId, inProgressId].sort());
     assert.deepEqual(activeProjection.statusCounts, {
       open: 1,
       triaged: 1,

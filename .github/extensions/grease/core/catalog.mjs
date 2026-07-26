@@ -1,17 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
-import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const CATALOG_VERSION = 5;
+const CATALOG_VERSION = 6;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
-const STORE_LOCK_STALE_MS = 30_000;
+const STORE_LOCK_GRACE_MS = 5_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
-const storeWriteQueues = new Map();
+const projectionWriteQueues = new Map();
+const appendWriteQueues = new Map();
 const disabledActiveProjectionRoots = new Set();
+const PROCESS_START_TIME_MS = Date.now() - Math.floor(process.uptime() * 1000);
+const CATALOG_TEMP_PATTERN = /^catalog\.json\.\d+\.\d+\.\d+\.tmp$/;
+const ACTIVE_TEMP_PATTERN = /^active\.json\.\d+\.\d+\.\d+\.tmp$/;
 let atomicWriteId = 0;
 
 export function defaultStoreRoot() {
@@ -20,13 +24,14 @@ export function defaultStoreRoot() {
 
 export async function appendEvent(event, options = {}) {
   const root = options.root ?? defaultStoreRoot();
-  return enqueueStoreWrite(root, async () => {
+  const normalized = await enqueueAppendWrite(root, async () => {
     await ensureStore(root);
-    const normalized = normalizeEvent(event, options);
-    await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
-    const catalog = await rebuildCatalogUnlocked(root);
-    return { event: normalized, catalog };
+    const entry = normalizeEvent(event, options);
+    await appendFile(eventsPath(root), `${JSON.stringify(entry)}\n`, "utf8");
+    return entry;
   });
+  await maintainProjectionAfterAppend(root);
+  return { event: normalized };
 }
 
 export async function readEvents(options = {}) {
@@ -53,41 +58,105 @@ export async function readEvents(options = {}) {
 
 export async function rebuildCatalog(options = {}) {
   const root = options.root ?? defaultStoreRoot();
-  return enqueueStoreWrite(root, () => rebuildCatalogUnlocked(root));
+  return enqueueProjectionWrite(root, () => rebuildCatalogUnlocked(root));
 }
 
 async function rebuildCatalogUnlocked(root) {
   await ensureStore(root);
-  const events = await readEvents({ root });
-  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
-  const generationId = buildGenerationId(events, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  const boundary = await captureEventLogBoundary(root);
+  const generationId = buildGenerationId(boundary.events, boundary.size, boundary.mtimeMs);
   const generatedAt = new Date().toISOString();
-  const catalog = buildCatalog(events, {
+  const catalog = buildCatalog(boundary.events, {
     generatedAt,
     generationId,
-    sourceEventLogBytes: sourceEventLogMetadata.size,
-    sourceEventLogMtimeMs: sourceEventLogMetadata.mtimeMs
+    sourceEventLogBytes: boundary.size,
+    sourceEventLogMtimeMs: boundary.mtimeMs
   });
   const active = buildActiveProjection(catalog);
   await writeJsonFilesAtomic(root, catalog, active);
   return catalog;
 }
 
-export async function readCatalog(options = {}) {
-  const root = options.root ?? defaultStoreRoot();
-  await ensureStore(root);
+async function maintainProjectionAfterAppend(root) {
+  // Capture never waits on projection work. Take the projection lock only if it
+  // is free. If a rebuild or repair already holds it, that holder sweeps temps
+  // and refreshes the projection, so this append returns without blocking.
+  const release = await tryAcquireProjectionLock(root);
+  if (!release) {
+    return;
+  }
   try {
-    const catalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
-    if (catalog.version !== CATALOG_VERSION) {
-      return rebuildCatalog({ root });
+    await sweepOrphanTempFiles(root);
+    try {
+      await stat(catalogPath(root));
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      await rebuildCatalogUnlocked(root);
     }
-    return catalog;
+  } finally {
+    await release();
+  }
+}
+
+async function captureEventLogBoundary(root) {
+  let handle;
+  try {
+    handle = await open(eventsPath(root), "r");
   } catch (error) {
     if (error?.code === "ENOENT") {
-      return rebuildCatalog({ root });
+      return { events: [], size: 0, mtimeMs: 0 };
     }
     throw error;
   }
+  try {
+    const info = await handle.stat();
+    const buffer = Buffer.alloc(info.size);
+    if (info.size > 0) {
+      await handle.read(buffer, 0, info.size, 0);
+    }
+    // The rebuild is pinned to this captured byte offset and identity. Appends
+    // that land after the boundary grow the file past info.size and are ignored
+    // here, so the published generation stays internally consistent.
+    return { events: parseEventLogBuffer(buffer), size: info.size, mtimeMs: info.mtimeMs };
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseEventLogBuffer(buffer) {
+  const lines = buffer.toString("utf8").split("\n");
+  // A trailing segment without a newline is a partial append past the captured
+  // boundary and must not be parsed as a complete event.
+  if (lines.length > 0 && lines[lines.length - 1] !== "") {
+    lines.pop();
+  }
+  const events = [];
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, "");
+    if (line.trim() === "") {
+      continue;
+    }
+    events.push(JSON.parse(line));
+  }
+  return events;
+}
+
+export async function readCatalog(options = {}) {
+  const root = options.root ?? defaultStoreRoot();
+  await ensureStore(root);
+  const validation = await validateCatalogProjection(root);
+  if (validation.valid) {
+    return validation.catalog;
+  }
+  return enqueueProjectionWrite(root, async () => {
+    const lockedValidation = await validateCatalogProjection(root);
+    if (lockedValidation.valid) {
+      return lockedValidation.catalog;
+    }
+    return rebuildCatalogUnlocked(root);
+  });
 }
 
 export async function readActiveCatalog(options = {}) {
@@ -113,7 +182,7 @@ export async function readActiveCatalog(options = {}) {
     return initialValidation.projection;
   }
 
-  return enqueueStoreWrite(root, async () => {
+  return enqueueProjectionWrite(root, async () => {
     let lockedValidation;
     try {
       lockedValidation = await validateActiveProjection(root, activeFilePath, { strict: true });
@@ -182,6 +251,37 @@ async function validateActiveProjection(root, activeFilePath, options = {}) {
     valid: true,
     projection: { ...active, path: activeFilePath }
   };
+}
+
+async function validateCatalogProjection(root) {
+  let catalog;
+  try {
+    catalog = JSON.parse(await readFile(catalogPath(root), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) {
+      return { valid: false };
+    }
+    throw error;
+  }
+  if (catalog.version !== CATALOG_VERSION) {
+    return { valid: false };
+  }
+  const sourceEventLogMetadata = await readSourceEventLogMetadata(root);
+  let expectedGenerationId;
+  try {
+    expectedGenerationId = await deriveGenerationId(root, sourceEventLogMetadata.size, sourceEventLogMetadata.mtimeMs);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return { valid: false };
+    }
+    throw error;
+  }
+  if (catalog.sourceEventLogBytes !== sourceEventLogMetadata.size ||
+      catalog.sourceEventLogMtimeMs !== sourceEventLogMetadata.mtimeMs ||
+      catalog.generationId !== expectedGenerationId) {
+    return { valid: false };
+  }
+  return { valid: true, catalog };
 }
 
 async function readActiveProjectionFile(root, activeFilePath) {
@@ -317,7 +417,7 @@ export async function getFriction(id, options = {}) {
   const activeCatalog = await readActiveCatalog(options);
   const activeItem = activeCatalog.items.find((candidate) => candidate.id === id);
   if (activeItem) {
-    const occurrences = activeCatalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
+    const occurrences = await readOccurrencesForId(id, options);
     return { item: activeItem, occurrences };
   }
   const catalog = await readCatalog(options);
@@ -330,7 +430,7 @@ export async function getFriction(id, options = {}) {
       nearestMatches: nearestFrictionMatches(id, catalog.items)
     };
   }
-  const occurrences = catalog.occurrences.filter((occurrence) => occurrence.frictionId === id);
+  const occurrences = await readOccurrencesForId(id, options);
   return { item, occurrences };
 }
 
@@ -345,7 +445,9 @@ export async function updateFriction(id, updates, options = {}) {
     itemId: id,
     updates: allowed
   };
-  return appendEvent(event, options);
+  const result = await appendEvent(event, options);
+  const catalog = await readCatalog(options);
+  return { event: result.event, catalog };
 }
 
 export async function updateFrictionBulk(ids, updates, options = {}) {
@@ -355,7 +457,7 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
   const allowed = normalizeFrictionUpdates(updates);
   const root = options.root ?? defaultStoreRoot();
   const at = options.now ?? new Date().toISOString();
-  return enqueueStoreWrite(root, async () => {
+  await enqueueAppendWrite(root, async () => {
     await ensureStore(root);
     for (const id of ids) {
       if (!id) {
@@ -369,9 +471,10 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
       }, options);
       await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
     }
-    const catalog = await rebuildCatalogUnlocked(root);
-    return { ids, catalog };
   });
+  await maintainProjectionAfterAppend(root);
+  const catalog = await readCatalog({ ...options, root });
+  return { ids, catalog };
 }
 
 export function buildCatalog(events, options = {}) {
@@ -385,24 +488,8 @@ export function buildCatalog(events, options = {}) {
 
   for (const event of events) {
     if (event.type === "friction.signal") {
-      const signal = event.signal ?? {};
-      const id = event.frictionId ?? fingerprintSignal(event);
-      const occurrence = {
-        id: event.id,
-        frictionId: id,
-        at: event.at,
-        sessionId: event.sessionId,
-        sessionName: event.sessionName,
-        machineName: event.machineName ?? os.hostname(),
-        workingDirectory: event.workingDirectory,
-        kind: signal.kind ?? "unknown",
-        source: signal.source ?? "unknown",
-        severity: signal.severity ?? "medium",
-        title: signal.title ?? "Friction captured",
-        summary: signal.summary ?? "",
-        tags: signal.tags ?? [],
-        evidence: signal.evidence ?? {}
-      };
+      const occurrence = occurrenceFromSignal(event);
+      const id = occurrence.frictionId;
       occurrences.push(occurrence);
       const existing = items.get(id);
       if (existing) {
@@ -462,15 +549,61 @@ export function buildCatalog(events, options = {}) {
     item.updatedAt = update.at;
   }
 
+  const occurrencesByRecency = [...occurrences].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  for (const occurrence of occurrencesByRecency) {
+    const item = items.get(occurrence.frictionId);
+    if (item && item.latestOccurrence === undefined) {
+      item.latestOccurrence = occurrence;
+    }
+  }
+
   return {
     version: CATALOG_VERSION,
     generatedAt,
     generationId,
     sourceEventLogBytes,
     sourceEventLogMtimeMs,
-    items: [...items.values()].sort(sortItems),
-    occurrences: occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)))
+    items: [...items.values()].sort(sortItems)
   };
+}
+
+function occurrenceFromSignal(event) {
+  const signal = event.signal ?? {};
+  const frictionId = event.frictionId ?? fingerprintSignal(event);
+  return {
+    id: event.id,
+    frictionId,
+    at: event.at,
+    sessionId: event.sessionId,
+    sessionName: event.sessionName,
+    machineName: event.machineName ?? os.hostname(),
+    workingDirectory: event.workingDirectory,
+    kind: signal.kind ?? "unknown",
+    source: signal.source ?? "unknown",
+    severity: signal.severity ?? "medium",
+    title: signal.title ?? "Friction captured",
+    summary: signal.summary ?? "",
+    tags: signal.tags ?? [],
+    evidence: signal.evidence ?? {}
+  };
+}
+
+function buildOccurrences(events) {
+  const occurrences = [];
+  for (const event of events) {
+    if (event.type === "friction.signal") {
+      occurrences.push(occurrenceFromSignal(event));
+    }
+  }
+  return occurrences.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+export async function readOccurrencesForId(id, options = {}) {
+  const occurrences = buildOccurrences(await readEvents(options));
+  if (id === undefined) {
+    return occurrences;
+  }
+  return occurrences.filter((occurrence) => occurrence.frictionId === id);
 }
 
 export function pathsForStore(root = defaultStoreRoot()) {
@@ -539,6 +672,10 @@ function storeLockPath(root) {
   return path.join(root, "catalog.lock");
 }
 
+function appendLockPath(root) {
+  return path.join(root, "append.lock");
+}
+
 async function writeJsonFilesAtomic(root, catalog, active) {
   const resolvedRoot = path.resolve(root);
   const catalogTempPath = `${catalogPath(root)}.${process.pid}.${Date.now()}.${atomicWriteId++}.tmp`;
@@ -588,20 +725,38 @@ async function readActiveCatalogFallback(root, activeFilePath) {
   return { ...buildActiveProjection(catalog), path: activeFilePath };
 }
 
-function enqueueStoreWrite(root, operation) {
-  const previous = storeWriteQueues.get(root) ?? Promise.resolve();
-  const next = previous.catch(() => undefined).then(() => withStoreLock(root, operation));
+function enqueueSerial(queues, root, operation) {
+  const previous = queues.get(root) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => operation());
   const tracked = next.finally(() => {
-    if (storeWriteQueues.get(root) === tracked) {
-      storeWriteQueues.delete(root);
+    if (queues.get(root) === tracked) {
+      queues.delete(root);
     }
   });
-  storeWriteQueues.set(root, tracked);
+  queues.set(root, tracked);
   return next;
 }
 
-async function withStoreLock(root, operation) {
-  const release = await acquireStoreLock(root);
+function enqueueProjectionWrite(root, operation) {
+  return enqueueSerial(projectionWriteQueues, root, () => withProjectionLock(root, operation));
+}
+
+function enqueueAppendWrite(root, operation) {
+  return enqueueSerial(appendWriteQueues, root, () => withAppendLock(root, operation));
+}
+
+async function withProjectionLock(root, operation) {
+  const release = await acquireLock(root, storeLockPath(root));
+  try {
+    await sweepOrphanTempFiles(root);
+    return await operation();
+  } finally {
+    await release();
+  }
+}
+
+export async function withAppendLock(root, operation) {
+  const release = await acquireLock(root, appendLockPath(root));
   try {
     return await operation();
   } finally {
@@ -609,25 +764,44 @@ async function withStoreLock(root, operation) {
   }
 }
 
-async function acquireStoreLock(root) {
+export async function sweepOrphanTempFiles(root) {
+  let entries;
+  try {
+    entries = await readdir(root);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const removed = [];
+  for (const name of entries) {
+    // Only the exclusive-lock holder runs this, so any file matching a strict
+    // projection owner-temp pattern is an orphan from a crashed write. The
+    // filename pid is never trusted for liveness; the held lock is the proof.
+    if (!CATALOG_TEMP_PATTERN.test(name) && !ACTIVE_TEMP_PATTERN.test(name)) {
+      continue;
+    }
+    await rm(path.join(root, name), { force: true }).catch(() => undefined);
+    removed.push(name);
+  }
+  return removed;
+}
+
+async function acquireLock(root, lockPath) {
   await mkdir(root, { recursive: true });
-  const lockPath = storeLockPath(root);
-  const owner = {
-    pid: process.pid,
-    id: randomUUID(),
-    acquiredAt: new Date().toISOString()
-  };
+  const owner = buildStoreLockOwner();
   const startedAt = Date.now();
   while (true) {
     try {
       await mkdir(lockPath);
       await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
-      return () => rm(lockPath, { recursive: true, force: true });
+      return () => releaseStoreLock(lockPath, owner.token);
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
-      await removeStaleLock(lockPath);
+      await reclaimAbandonedLock(lockPath);
       if (Date.now() - startedAt > STORE_LOCK_TIMEOUT_MS) {
         throw new Error(`Timed out waiting for Grease store lock: ${lockPath}`);
       }
@@ -636,7 +810,102 @@ async function acquireStoreLock(root) {
   }
 }
 
-async function removeStaleLock(lockPath) {
+async function tryAcquireProjectionLock(root) {
+  await mkdir(root, { recursive: true });
+  const lockPath = storeLockPath(root);
+  const owner = buildStoreLockOwner();
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
+      return () => releaseStoreLock(lockPath, owner.token);
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      // A live holder owns the projection lock, so never wait. Reclaim only a
+      // provably abandoned lock, then retry the claim exactly once.
+      await reclaimAbandonedLock(lockPath);
+    }
+  }
+  return undefined;
+}
+
+export function buildStoreLockOwner() {
+  return {
+    pid: process.pid,
+    startTimeMs: PROCESS_START_TIME_MS,
+    token: randomUUID(),
+    acquiredAt: new Date().toISOString()
+  };
+}
+
+export function isStoreLockOwnerAlive(owner) {
+  const pid = owner?.pid;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but this process may not signal it.
+    return error?.code === "EPERM";
+  }
+}
+
+export function shouldReclaimStoreLock(owner, options = {}) {
+  const now = options.now ?? Date.now();
+  const mtimeMs = options.mtimeMs ?? now;
+  const graceMs = options.graceMs ?? STORE_LOCK_GRACE_MS;
+  const isAlive = options.isProcessAliveFn ?? ((pid) => isStoreLockOwnerAlive({ pid }));
+  if (!owner || !Number.isInteger(owner.pid)) {
+    // Missing or corrupt owner metadata may be the mkdir->owner.json window.
+    // Reclaim only after a bounded grace so a half-written lock survives.
+    return now - mtimeMs > graceMs;
+  }
+  return !isAlive(owner.pid);
+}
+
+export async function releaseStoreLock(lockPath, ownerToken) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    // A corrupt owner.json is not proof of ownership, so refuse to delete it.
+    return;
+  }
+  if (owner.token !== ownerToken) {
+    // The lock was reclaimed and re-acquired by another owner. Deleting it now
+    // would be an ABA deletion of a foreign lock.
+    return;
+  }
+  const tombstonePath = `${lockPath}.${process.pid}.${atomicWriteId++}.released`;
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      await rename(lockPath, tombstonePath);
+      break;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return;
+      }
+      // Windows can transiently refuse a directory rename with EPERM/EBUSY when
+      // another store operation holds a handle on the parent. Retry within a
+      // bound rather than leaking the lock, matching replaceFileWithRetry.
+      if (!isRetryableReplaceError(error) || Date.now() - startedAt > FILE_REPLACE_TIMEOUT_MS) {
+        throw error;
+      }
+      await waitForRetry();
+    }
+  }
+  await rm(tombstonePath, { recursive: true, force: true });
+}
+
+async function reclaimAbandonedLock(lockPath) {
   let info;
   try {
     info = await stat(lockPath);
@@ -646,7 +915,16 @@ async function removeStaleLock(lockPath) {
     }
     throw error;
   }
-  if (Date.now() - info.mtimeMs <= STORE_LOCK_STALE_MS) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) {
+      throw error;
+    }
+    owner = undefined;
+  }
+  if (!shouldReclaimStoreLock(owner, { now: Date.now(), mtimeMs: info.mtimeMs })) {
     return;
   }
   await rm(lockPath, { recursive: true, force: true });
@@ -694,13 +972,6 @@ function buildActiveProjection(catalog) {
       statusCounts[item.status] += 1;
     }
   }
-  const activeIds = new Set(items.map((item) => item.id));
-  const occurrences = [];
-  for (const occurrence of catalog.occurrences ?? []) {
-    if (activeIds.has(occurrence.frictionId)) {
-      occurrences.push({ ...occurrence });
-    }
-  }
   return {
     version: catalog.version,
     generatedAt: catalog.generatedAt,
@@ -708,7 +979,6 @@ function buildActiveProjection(catalog) {
     sourceEventLogBytes: catalog.sourceEventLogBytes,
     sourceEventLogMtimeMs: catalog.sourceEventLogMtimeMs,
     items: items.map((item) => ({ ...item })),
-    occurrences,
     statusCounts
   };
 }

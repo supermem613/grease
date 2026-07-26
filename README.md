@@ -44,11 +44,31 @@ Grease stores data under `~\.grease` by default:
 ```text
 ~\.grease\
   events.jsonl      # append-only source of truth
-  catalog.json      # full historical projection
+  catalog.json      # disposable full historical projection
   active.json       # disposable actionable working-set projection
 ```
 
-`events.jsonl` is the append-only source of truth. `catalog.json` is the retained full historical projection, including resolved and ignored items. `active.json` is the disposable actionable working-set projection used by active-status searches and status summaries. If `active.json` is missing, stale, incompatible, or interrupted, it is rebuilt from `events.jsonl` under the store lock. Resolved and ignored items remain queryable through the full catalog, and no-status search behavior is unchanged. Active status searches and status summaries use `active.json`, but CLI and tool output schemas stay the same.
+`events.jsonl` is the only source of truth. Both `catalog.json` and `active.json` are disposable projections rebuilt from the log. If either is missing, stale, incompatible, or interrupted, it is rebuilt from `events.jsonl`. Resolved and ignored items stay queryable through the full catalog, and search output schemas are unchanged.
+
+### Append-only capture
+
+Capture never rewrites a projection. Each capture appends one line to `events.jsonl` and returns. A projection refresh happens off the hot path and only when the projection is actually stale, so a large catalog no longer pays a multi-megabyte rewrite on every event.
+
+### Bounded projections
+
+Projections no longer persist a per-item `occurrences[]` array, so `catalog.json` and `active.json` stay bounded in size as the log grows. Each item keeps a single `item.latestOccurrence`. When a caller needs the full occurrence history, Grease reconstructs it on read from `events.jsonl`. `CATALOG_VERSION` is `6`; an older projection triggers a one-time rebuild into the bounded shape.
+
+### Lock ownership and reclaim
+
+The projection lock records its owner as process id, process start time, and a random token. A holder releases the lock only after checking that token, so a stale rename can never delete a live owner's lock. A dead owner's lock is reclaimed at once. A missing or corrupt owner record is reclaimed only after a bounded grace window.
+
+### Lock-owned temp sweeper
+
+Atomic writes stage a temp file before rename. A crash can leave a strict orphan named `catalog.json.<pid>.<ts>.<n>.tmp` or `active.json.<pid>.<ts>.<n>.tmp`. The projection holder sweeps only those strict orphans while it owns the lock. Unrelated temp files, non-numeric names, an in-flight write, and `events.jsonl` all survive.
+
+### Split append and projection locks
+
+Two locks keep capture off the projection path. `append.lock` serializes only the append to `events.jsonl`. `catalog.lock` serializes projection rebuild, publication, read-repair, and the temp sweep. After appending, capture takes a non-blocking pass at the projection lock and skips maintenance when a live rebuild already holds it, so capture never waits on a slow rebuild. Each rebuild pins its events boundary with one file read and publishes a single generation, so concurrent stale readers publish exactly one generation and appends landing during a rebuild cannot skew it.
 
 ## Agent tools
 

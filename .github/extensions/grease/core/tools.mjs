@@ -1,4 +1,4 @@
-import { appendEvent, getFriction, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "./catalog.mjs";
+import { appendEvent, getFriction, readCatalog, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "./catalog.mjs";
 import { buildBrief } from "./brief.mjs";
 import { classifyManualCapture } from "./classifier.mjs";
 
@@ -65,9 +65,10 @@ export function createGreaseTools(options = {}) {
           now: options.now?.()
         });
         const result = await appendEvent(event, options);
+        const catalog = await readCatalog(options);
         return success("grease_capture", {
           eventId: result.event.id,
-          itemCount: result.catalog.items.length
+          itemCount: catalog.items.length
         });
       }
     },
