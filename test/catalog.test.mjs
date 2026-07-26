@@ -1003,6 +1003,101 @@ async function seedActiveProjectionItems(root) {
   };
 }
 
+test("a lock claim treats a mid-release directory as contention and a real fault as fatal", () => {
+  for (const code of ["EEXIST", "EPERM", "EBUSY", "EACCES"]) {
+    assert.equal(
+      catalogStore.isTransientLockContention({ code }),
+      true,
+      `${code} means a rival holds the lock or a release is in flight, so the claim must retry`
+    );
+  }
+  for (const code of ["ENOSPC", "ENOTDIR", "EROFS"]) {
+    assert.equal(
+      catalogStore.isTransientLockContention({ code }),
+      false,
+      `${code} is a real filesystem fault and must reach the caller instead of spinning`
+    );
+  }
+});
+
+test("a rebuild claims the store lock that a concurrent release is vacating", async () => {
+  const root = await tempRoot();
+  const lockPath = path.join(root, "catalog.lock");
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "lock-handoff",
+      error: "Lock handoff"
+    }, {
+      sessionId: "session-lock-handoff",
+      sessionName: "Lock Handoff",
+      workingDirectory: "C:\\repo"
+    });
+    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    // releaseStoreLock renames the lock to a tombstone before removing it, and
+    // on Windows a claim landing inside that window sees EPERM instead of
+    // EEXIST. Drive the handoff repeatedly so a claim that gives up on the
+    // transient code cannot pass here.
+    for (let cycle = 0; cycle < 30; cycle += 1) {
+      const owner = catalogStore.buildStoreLockOwner();
+      await mkdir(lockPath);
+      await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
+
+      const rebuildPromise = catalogStore.rebuildCatalog({ root });
+      await new Promise((resolve) => setImmediate(resolve));
+      await catalogStore.releaseStoreLock(lockPath, owner.token);
+
+      const catalog = await rebuildPromise;
+      assert.ok(catalog.generationId, `cycle ${cycle}: the rebuild claims the lock the release just vacated`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed projection write rejects its caller and leaves the queue serving later work", async () => {
+  const root = await tempRoot();
+  const unhandled = [];
+  const recordUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", recordUnhandled);
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "queue-failure",
+      error: "Queue failure"
+    }, {
+      sessionId: "session-queue-failure",
+      sessionName: "Queue Failure",
+      workingDirectory: "C:\\repo"
+    });
+    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+
+    const catalogFile = pathsForStore(root).catalog;
+    await rm(catalogFile, { recursive: true, force: true });
+    await mkdir(catalogFile, { recursive: true });
+    await assert.rejects(
+      catalogStore.rebuildCatalog({ root }),
+      "the caller's promise carries the projection write failure"
+    );
+
+    await rm(catalogFile, { recursive: true, force: true });
+    const recovered = await catalogStore.rebuildCatalog({ root });
+    assert.ok(recovered.generationId, "the serial queue still serves work after a failed entry");
+
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      unhandled,
+      [],
+      "the queue bookkeeping handle stays handled, so a failed write raises no unhandled rejection"
+    );
+  } finally {
+    process.off("unhandledRejection", recordUnhandled);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function tempRoot() {
   return mkdtemp(path.join(os.tmpdir(), "grease-test-"));
 }

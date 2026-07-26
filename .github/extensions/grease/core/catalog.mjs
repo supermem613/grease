@@ -728,7 +728,10 @@ async function readActiveCatalogFallback(root, activeFilePath) {
 function enqueueSerial(queues, root, operation) {
   const previous = queues.get(root) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(() => operation());
-  const tracked = next.finally(() => {
+  // The queue handle exists only to sequence later work, so it must never be
+  // the promise that carries a failure. The caller's promise reports the
+  // error; leaving it on this handle too surfaces an unhandled rejection.
+  const tracked = next.catch(() => undefined).finally(() => {
     if (queues.get(root) === tracked) {
       queues.delete(root);
     }
@@ -792,18 +795,28 @@ async function acquireLock(root, lockPath) {
   await mkdir(root, { recursive: true });
   const owner = buildStoreLockOwner();
   const startedAt = Date.now();
+  let lastError;
   while (true) {
     try {
       await mkdir(lockPath);
       await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
       return () => releaseStoreLock(lockPath, owner.token);
     } catch (error) {
-      if (error?.code !== "EEXIST") {
+      if (!isTransientLockContention(error)) {
         throw error;
       }
-      await reclaimAbandonedLock(lockPath);
+      lastError = error;
+      // Only EEXIST proves a rival lock directory is actually there. The
+      // Windows-transient codes mean the path is mid-release, so there is
+      // nothing to inspect and stat would race the same deletion.
+      if (error.code === "EEXIST") {
+        await reclaimAbandonedLock(lockPath);
+      }
       if (Date.now() - startedAt > STORE_LOCK_TIMEOUT_MS) {
-        throw new Error(`Timed out waiting for Grease store lock: ${lockPath}`);
+        throw new Error(
+          `Timed out waiting for Grease store lock: ${lockPath} (last error: ${lastError.code})`,
+          { cause: lastError }
+        );
       }
       await waitForRetry();
     }
@@ -820,12 +833,16 @@ async function tryAcquireProjectionLock(root) {
       await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
       return () => releaseStoreLock(lockPath, owner.token);
     } catch (error) {
-      if (error?.code !== "EEXIST") {
+      if (!isTransientLockContention(error)) {
         throw error;
       }
       // A live holder owns the projection lock, so never wait. Reclaim only a
-      // provably abandoned lock, then retry the claim exactly once.
-      await reclaimAbandonedLock(lockPath);
+      // provably abandoned lock, then retry the claim exactly once. A
+      // Windows-transient code means a release is in flight, so the next
+      // attempt is enough and capture must never fail for optional upkeep.
+      if (error.code === "EEXIST") {
+        await reclaimAbandonedLock(lockPath);
+      }
     }
   }
   return undefined;
@@ -947,6 +964,14 @@ async function replaceFileWithRetry(sourcePath, targetPath) {
 
 function isRetryableReplaceError(error) {
   return error?.code === "EPERM" || error?.code === "EBUSY" || error?.code === "EACCES";
+}
+
+// A lock claim races the tombstone rename and removal in releaseStoreLock.
+// EEXIST means a rival lock is present; the Windows codes mean the directory
+// is mid-release and the claim can succeed on a later attempt. Anything else
+// is a real filesystem fault and must reach the caller unchanged.
+export function isTransientLockContention(error) {
+  return error?.code === "EEXIST" || isRetryableReplaceError(error);
 }
 
 async function waitForRetry() {
