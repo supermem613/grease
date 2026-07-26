@@ -145,6 +145,91 @@ test("grease pr2 bounded projection: occurrences reconstructed from log and vers
   }
 });
 
+test("grease pr3 lock ownership: non-owner release cannot delete a reclaimed lock and dead-owner locks are reclaimed", async () => {
+  const root = await tempRoot();
+  const pathExists = async (target) => {
+    try {
+      await stat(target);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return false;
+      }
+      throw error;
+    }
+  };
+  try {
+    assert.equal(typeof catalogStore.releaseStoreLock, "function", "pr3: ownership-checked releaseStoreLock must exist");
+    assert.equal(typeof catalogStore.shouldReclaimStoreLock, "function", "pr3: liveness-aware shouldReclaimStoreLock must exist");
+    assert.equal(typeof catalogStore.isStoreLockOwnerAlive, "function", "pr3: pid liveness probe must exist");
+    assert.equal(typeof catalogStore.buildStoreLockOwner, "function", "pr3: pid + start-time owner identity must exist");
+
+    const lockPath = path.join(root, "catalog.lock");
+
+    const ownerA = catalogStore.buildStoreLockOwner();
+    assert.equal(typeof ownerA.pid, "number");
+    assert.equal(typeof ownerA.startTimeMs, "number");
+    assert.equal(typeof ownerA.token, "string");
+
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(ownerA, null, 2)}\n`, "utf8");
+
+    const ownerB = catalogStore.buildStoreLockOwner();
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(ownerB, null, 2)}\n`, "utf8");
+
+    await catalogStore.releaseStoreLock(lockPath, ownerA.token);
+    assert.equal(await pathExists(path.join(lockPath, "owner.json")), true, "pr3: a non-owner release must not delete a foreign lock");
+    const survivingOwner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+    assert.equal(survivingOwner.token, ownerB.token, "pr3: the reclaimed lock still belongs to its new owner");
+
+    await catalogStore.releaseStoreLock(lockPath, ownerB.token);
+    assert.equal(await pathExists(lockPath), false, "pr3: the owner's release removes its own lock");
+
+    assert.equal(catalogStore.isStoreLockOwnerAlive({ pid: process.pid }), true, "pr3: the current process is alive");
+    assert.equal(catalogStore.isStoreLockOwnerAlive({ pid: 0 }), false, "pr3: an invalid pid is not alive");
+
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock({ pid: 424242, token: "dead" }, { now: 1000, mtimeMs: 999, graceMs: 5000, isProcessAliveFn: () => false }),
+      true,
+      "pr3: a lock owned by a provably dead process is reclaimed even when fresh"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock({ pid: process.pid, token: "live" }, { now: 10_000_000, mtimeMs: 0, graceMs: 5000, isProcessAliveFn: () => true }),
+      false,
+      "pr3: a live owner's lock is never reclaimed by age"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock(undefined, { now: 1000, mtimeMs: 999, graceMs: 5000 }),
+      false,
+      "pr3: missing owner metadata within the grace window is not reclaimed"
+    );
+    assert.equal(
+      catalogStore.shouldReclaimStoreLock(undefined, { now: 10_000, mtimeMs: 0, graceMs: 5000 }),
+      true,
+      "pr3: missing owner metadata beyond the grace window is reclaimed"
+    );
+
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify({ pid: 0, token: "dead-owner", acquiredAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
+    const [deadOwnerSignal] = classifySessionEvent("tool.execution_complete", {
+      success: false,
+      toolName: "pr3-dead-owner",
+      error: "Dead owner lock"
+    }, {
+      sessionId: "pr3-dead-owner",
+      sessionName: "PR3 Dead Owner",
+      workingDirectory: "C:\\repo"
+    });
+    const appended = await appendEvent(deadOwnerSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+    assert.ok(appended.event.id, "pr3: a write reclaims a dead-owner lock and proceeds");
+    assert.equal(await pathExists(lockPath), false, "pr3: the reclaimed lock is released after the write");
+    const events = await readEvents({ root });
+    assert.ok(events.some((event) => event.id === appended.event.id), "pr3: the reclaiming write is durable");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("append-only log is source of truth for compacted catalog", async () => {
   const root = await tempRoot();
   try {

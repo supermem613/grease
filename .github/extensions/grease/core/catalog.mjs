@@ -8,10 +8,11 @@ const CATALOG_VERSION = 6;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
-const STORE_LOCK_STALE_MS = 30_000;
+const STORE_LOCK_GRACE_MS = 5_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
 const storeWriteQueues = new Map();
 const disabledActiveProjectionRoots = new Set();
+const PROCESS_START_TIME_MS = Date.now() - Math.floor(process.uptime() * 1000);
 let atomicWriteId = 0;
 
 export function defaultStoreRoot() {
@@ -687,22 +688,18 @@ async function withStoreLock(root, operation) {
 async function acquireStoreLock(root) {
   await mkdir(root, { recursive: true });
   const lockPath = storeLockPath(root);
-  const owner = {
-    pid: process.pid,
-    id: randomUUID(),
-    acquiredAt: new Date().toISOString()
-  };
+  const owner = buildStoreLockOwner();
   const startedAt = Date.now();
   while (true) {
     try {
       await mkdir(lockPath);
       await writeFile(path.join(lockPath, "owner.json"), `${JSON.stringify(owner, null, 2)}\n`, "utf8");
-      return () => rm(lockPath, { recursive: true, force: true });
+      return () => releaseStoreLock(lockPath, owner.token);
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
-      await removeStaleLock(lockPath);
+      await reclaimAbandonedLock(lockPath);
       if (Date.now() - startedAt > STORE_LOCK_TIMEOUT_MS) {
         throw new Error(`Timed out waiting for Grease store lock: ${lockPath}`);
       }
@@ -711,7 +708,71 @@ async function acquireStoreLock(root) {
   }
 }
 
-async function removeStaleLock(lockPath) {
+export function buildStoreLockOwner() {
+  return {
+    pid: process.pid,
+    startTimeMs: PROCESS_START_TIME_MS,
+    token: randomUUID(),
+    acquiredAt: new Date().toISOString()
+  };
+}
+
+export function isStoreLockOwnerAlive(owner) {
+  const pid = owner?.pid;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but this process may not signal it.
+    return error?.code === "EPERM";
+  }
+}
+
+export function shouldReclaimStoreLock(owner, options = {}) {
+  const now = options.now ?? Date.now();
+  const mtimeMs = options.mtimeMs ?? now;
+  const graceMs = options.graceMs ?? STORE_LOCK_GRACE_MS;
+  const isAlive = options.isProcessAliveFn ?? ((pid) => isStoreLockOwnerAlive({ pid }));
+  if (!owner || !Number.isInteger(owner.pid)) {
+    // Missing or corrupt owner metadata may be the mkdir->owner.json window.
+    // Reclaim only after a bounded grace so a half-written lock survives.
+    return now - mtimeMs > graceMs;
+  }
+  return !isAlive(owner.pid);
+}
+
+export async function releaseStoreLock(lockPath, ownerToken) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    // A corrupt owner.json is not proof of ownership, so refuse to delete it.
+    return;
+  }
+  if (owner.token !== ownerToken) {
+    // The lock was reclaimed and re-acquired by another owner. Deleting it now
+    // would be an ABA deletion of a foreign lock.
+    return;
+  }
+  const tombstonePath = `${lockPath}.${process.pid}.${atomicWriteId++}.released`;
+  try {
+    await rename(lockPath, tombstonePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  await rm(tombstonePath, { recursive: true, force: true });
+}
+
+async function reclaimAbandonedLock(lockPath) {
   let info;
   try {
     info = await stat(lockPath);
@@ -721,7 +782,16 @@ async function removeStaleLock(lockPath) {
     }
     throw error;
   }
-  if (Date.now() - info.mtimeMs <= STORE_LOCK_STALE_MS) {
+  let owner;
+  try {
+    owner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) {
+      throw error;
+    }
+    owner = undefined;
+  }
+  if (!shouldReclaimStoreLock(owner, { now: Date.now(), mtimeMs: info.mtimeMs })) {
     return;
   }
   await rm(lockPath, { recursive: true, force: true });
