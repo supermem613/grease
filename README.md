@@ -83,6 +83,8 @@ The extension registers these six tools:
 | `grease_update` | Change status, severity, tags, or note on one item (`id`) or many items at once (`ids`). |
 | `grease_brief` | Generate a kickoff prompt from one or more items. |
 
+Every tool reports a rejected call as a normal result whose payload carries `ok: false`, a `problems` array naming each offending argument, and a `recovery` line. Missing arguments, wrong types, and values outside an accepted set are all reported together, so a caller fixes them in one retry. Tools never reject by throwing, because the host discards a thrown message and shows only `Tool execution failed`.
+
 ## Programmatic CLI
 
 Grease also ships a dependency-free CLI for scripts and agents. Run these from the repo root:

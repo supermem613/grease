@@ -2,6 +2,46 @@ import { appendEvent, getFriction, readCatalog, readCatalogSummary, searchCatalo
 import { buildBrief } from "./brief.mjs";
 import { classifyManualCapture } from "./classifier.mjs";
 
+const SEVERITIES = ["low", "medium", "high", "critical"];
+const STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
+
+const CAPTURE_RULES = [
+  { field: "title", type: "string", required: true },
+  { field: "summary", type: "string", required: true },
+  { field: "severity", type: "string", required: true, accepted: SEVERITIES },
+  { field: "kind", type: "string", required: true },
+  { field: "source", type: "string", required: true },
+  { field: "evidence", type: "string", required: true },
+  { field: "machineName", type: "string" },
+  { field: "sessionName", type: "string" },
+  { field: "workingDirectory", type: "string" },
+  { field: "tags", type: "array" }
+];
+
+const GET_RULES = [{ field: "id", type: "string", required: true }];
+
+const UPDATE_RULES = [
+  { field: "id", type: "string", expected: "a Grease item id, or use ids for a bulk update" },
+  { field: "ids", type: "array" },
+  { field: "status", type: "string", accepted: STATUSES },
+  { field: "severity", type: "string", accepted: SEVERITIES },
+  { field: "tags", type: "array" },
+  { field: "note", type: "string" }
+];
+
+const SEARCH_RULES = [
+  { field: "query", type: "string" },
+  { field: "status", type: "string" },
+  { field: "limit", type: "number" }
+];
+
+const BRIEF_RULES = [
+  { field: "ids", type: "array" },
+  { field: "query", type: "string" },
+  { field: "status", type: "string" },
+  { field: "limit", type: "number" }
+];
+
 export function createGreaseTools(options = {}) {
   // options.now is a clock FUNCTION used to stamp events. The store layer takes
   // a timestamp string, so the clock is resolved here and never forwarded as a
@@ -13,7 +53,7 @@ export function createGreaseTools(options = {}) {
     const now = clock?.();
     return now === undefined ? storeOptions : { ...storeOptions, now };
   };
-  return [
+  return guardAll([
     {
       name: "grease_status",
       description: "Show Grease catalog health and friction counts.",
@@ -69,6 +109,10 @@ export function createGreaseTools(options = {}) {
         required: ["title", "summary", "severity", "kind", "source", "evidence"]
       },
       handler: async (args, invocation) => {
+        const rejected = reject("grease_capture", args, CAPTURE_RULES);
+        if (rejected) {
+          return rejected;
+        }
         const event = classifyManualCapture(args, {
           sessionId: invocation?.sessionId,
           sessionName: sessionNameFrom(invocation),
@@ -95,6 +139,10 @@ export function createGreaseTools(options = {}) {
         }
       },
       handler: async (args) => {
+        const rejected = reject("grease_search", args, SEARCH_RULES);
+        if (rejected) {
+          return rejected;
+        }
         const result = await searchCatalog(args, storeOptions);
         return success("grease_search", {
           items: result.items
@@ -112,6 +160,10 @@ export function createGreaseTools(options = {}) {
         required: ["id"]
       },
       handler: async (args) => {
+        const rejected = reject("grease_get", args, GET_RULES);
+        if (rejected) {
+          return rejected;
+        }
         return success("grease_get", await getFriction(args.id, storeOptions));
       }
     },
@@ -131,7 +183,12 @@ export function createGreaseTools(options = {}) {
       },
       handler: async (args) => {
         const { id, ids, ...updates } = args;
-        if (Array.isArray(ids) && ids.length > 0) {
+        const bulk = Array.isArray(ids) && ids.length > 0;
+        const rejected = reject("grease_update", args, UPDATE_RULES, bulk ? [] : ["id"]);
+        if (rejected) {
+          return rejected;
+        }
+        if (bulk) {
           const result = await updateFrictionBulk(ids, updates, storeOptionsAtNow());
           return success("grease_update", {
             itemIds: result.ids,
@@ -158,10 +215,105 @@ export function createGreaseTools(options = {}) {
         }
       },
       handler: async (args) => {
+        const rejected = reject("grease_brief", args, BRIEF_RULES);
+        if (rejected) {
+          return rejected;
+        }
         return success("grease_brief", await buildBrief(args, storeOptions));
       }
     }
-  ];
+  ]);
+}
+
+// Every rejection has to be a returned result. The host SDK discards a thrown
+// error's message and reports only "Tool execution failed", which turns a
+// fixable argument mistake into an apparently broken tool. guardAll makes that
+// impossible for any tool, including ones added later.
+function guardAll(tools) {
+  return tools.map((tool) => ({
+    ...tool,
+    handler: async (args, invocation) => {
+      try {
+        return await tool.handler(args, invocation);
+      } catch (error) {
+        const detail = error?.message ?? String(error);
+        return failure(tool.name, {
+          error: detail,
+          recovery: `${tool.name} rejected the call: ${detail}. Correct that and call ${tool.name} again.`
+        });
+      }
+    }
+  }));
+}
+
+function reject(command, args = {}, rules, alsoRequired = []) {
+  const problems = [];
+  for (const rule of rules) {
+    const required = rule.required || alsoRequired.includes(rule.field);
+    const expected = rule.expected ?? expectationFor(rule);
+    const value = args?.[rule.field];
+    if (value === undefined || value === null) {
+      if (required) {
+        problems.push({ field: rule.field, problem: "missing", expected });
+      }
+      continue;
+    }
+    const problem = shapeProblem(rule, value);
+    if (problem) {
+      problems.push({ field: rule.field, expected, ...problem });
+      continue;
+    }
+    if (rule.accepted && !rule.accepted.includes(value)) {
+      problems.push({
+        field: rule.field,
+        problem: "not an accepted value",
+        received: value,
+        accepted: rule.accepted
+      });
+    }
+  }
+  if (problems.length === 0) {
+    return undefined;
+  }
+  const fields = problems.map((problem) => problem.field).join(", ");
+  return failure(command, {
+    error: "invalid arguments",
+    problems,
+    recovery: `Correct these ${command} arguments and call it again: ${fields}.`
+  });
+}
+
+function shapeProblem(rule, value) {
+  if (rule.type === "array") {
+    return Array.isArray(value) ? undefined : { problem: "wrong type", received: typeNameOf(value) };
+  }
+  if (Array.isArray(value) || typeof value !== rule.type) {
+    return { problem: "wrong type", received: typeNameOf(value) };
+  }
+  if (rule.type === "string" && value.trim() === "") {
+    return { problem: "empty", received: "an empty string" };
+  }
+  if (rule.type === "number" && !Number.isFinite(value)) {
+    return { problem: "wrong type", received: String(value) };
+  }
+  return undefined;
+}
+
+function expectationFor(rule) {
+  if (rule.accepted) {
+    return `one of ${rule.accepted.join(", ")}`;
+  }
+  if (rule.type === "array") {
+    return "an array of strings";
+  }
+  if (rule.type === "number") {
+    return "a number";
+  }
+  return "a non-empty string";
+}
+
+function typeNameOf(value) {
+  return Array.isArray(value) ? "array" : typeof value;
 }
 
 function success(command, data) {
@@ -171,6 +323,21 @@ function success(command, data) {
       ok: true,
       command,
       data
+    })
+  };
+}
+
+// A rejection travels on the success transport on purpose. The payload says
+// ok false, so the caller still sees a failure, while the diagnostic text takes
+// the same path as the grease_get not-found guidance, which is known to reach
+// the caller intact.
+function failure(command, data) {
+  return {
+    resultType: "success",
+    textResultForLlm: JSON.stringify({
+      ok: false,
+      command,
+      ...data
     })
   };
 }

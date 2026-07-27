@@ -229,6 +229,19 @@ async function callTool(tool, args) {
   return JSON.parse(result.textResultForLlm);
 }
 
+// The host SDK discards a thrown error's message and reports only "Tool
+// execution failed", so a rejected argument has to come back as a returned
+// result rather than a throw. This helper reads that result without asserting
+// the outcome so the validation tests can inspect a rejection.
+async function rawCallTool(tool, args) {
+  const result = await tool.handler(args, { sessionId: "session-1", sessionName: "Tool test session" });
+  return { result, payload: JSON.parse(result.textResultForLlm) };
+}
+
+function problemFor(payload, field) {
+  return payload.problems.find((problem) => problem.field === field);
+}
+
 test("an injected clock stamps captures and updates without reaching the store layer", async () => {
   // createGreaseTools takes now as a clock function while the store layer takes
   // a timestamp string. Forwarding the function to the store wrote it into
@@ -268,6 +281,146 @@ test("the store layer refuses a clock function in place of a timestamp", async (
       /now option must be an ISO timestamp string/,
       "a non-string now is refused rather than written into the event"
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture missing a required field names that field instead of failing opaquely", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_capture"), {
+      summary: "Every required field except title is supplied",
+      severity: "low",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "Omit title on purpose"
+    });
+
+    assert.equal(payload.ok, false);
+    assert.equal(payload.command, "grease_capture");
+    assert.equal(problemFor(payload, "title").problem, "missing");
+    assert.match(payload.recovery, /title/, "the recovery text names the field the caller must supply");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture missing several required fields reports all of them in one response", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_capture"), { severity: "low" });
+
+    assert.equal(payload.ok, false);
+    assert.deepEqual(
+      payload.problems.map((problem) => problem.field).sort(),
+      ["evidence", "kind", "source", "summary", "title"],
+      "one response lists every missing field so the caller fixes them in a single retry"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture with a wrong-typed field reports the type it received", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_capture"), {
+      title: 42,
+      summary: "Title is a number",
+      severity: "low",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "Send a number where a string belongs"
+    });
+
+    assert.equal(payload.ok, false);
+    const problem = problemFor(payload, "title");
+    assert.equal(problem.problem, "wrong type");
+    assert.equal(problem.received, "number");
+    assert.equal(problem.expected, "a non-empty string");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a capture with an out-of-enum severity lists the accepted values", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_capture"), {
+      title: "Severity out of range",
+      summary: "Severity is not one of the accepted values",
+      severity: "urgent",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "Send an unsupported severity"
+    });
+
+    assert.equal(payload.ok, false);
+    const problem = problemFor(payload, "severity");
+    assert.equal(problem.problem, "not an accepted value");
+    assert.equal(problem.received, "urgent");
+    assert.deepEqual(problem.accepted, ["low", "medium", "high", "critical"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a rejected capture writes no event, so a validation mistake leaves no catalog entry", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    await rawCallTool(tools.get("grease_capture"), { severity: "low" });
+
+    const { items } = await searchCatalog({}, { root });
+    assert.equal(items.length, 0, "a rejected call leaves the catalog untouched");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease_get without an id names the missing field rather than failing opaquely", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_get"), {});
+
+    assert.equal(payload.ok, false);
+    assert.equal(problemFor(payload, "id").problem, "missing");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease_update with neither id nor ids says which arguments satisfy the call", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_update"), { status: "resolved" });
+
+    assert.equal(payload.ok, false);
+    const problem = problemFor(payload, "id");
+    assert.equal(problem.problem, "missing");
+    assert.match(problem.expected, /ids/, "the caller is told the bulk alternative exists");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease_update with an out-of-enum status lists the accepted values", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const { payload } = await rawCallTool(tools.get("grease_update"), { id: "abc", status: "done" });
+
+    assert.equal(payload.ok, false);
+    const problem = problemFor(payload, "status");
+    assert.equal(problem.problem, "not an accepted value");
+    assert.deepEqual(problem.accepted, ["open", "triaged", "in-progress", "resolved", "ignored"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
