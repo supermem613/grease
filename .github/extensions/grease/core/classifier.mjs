@@ -64,9 +64,12 @@ export function classifyManualCapture(input = {}, context = {}) {
   const now = context.now ?? new Date().toISOString();
   const title = requiredString(input.title, "title");
   const summary = requiredString(input.summary, "summary");
+  const toolCallId = context.toolCallId;
   return {
     type: "friction.signal",
-    id: stableId(["manual", title, summary, now]),
+    // The call id, when the host supplies one, is what lets the projection tell
+    // several host deliveries of one capture apart from several real captures.
+    id: stableId(["manual", toolCallId, title, summary, toolCallId ? "" : now]),
     at: now,
     sessionId: context.sessionId,
     sessionName: input.sessionName ?? context.sessionName,
@@ -80,7 +83,8 @@ export function classifyManualCapture(input = {}, context = {}) {
       summary,
       tags: normalizeTags(input.tags),
       evidence: {
-        note: summarizeValue(input.evidence ?? summary)
+        note: summarizeValue(input.evidence ?? summary),
+        ...(toolCallId ? { toolCallId } : {})
       }
     }
   };

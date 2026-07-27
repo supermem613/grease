@@ -481,12 +481,16 @@ export function buildCatalog(events, options = {}) {
   const items = new Map();
   const occurrences = [];
   const updates = [];
+  const seenEventKeys = new Set();
   const generatedAt = options.generatedAt ?? new Date().toISOString();
   const generationId = options.generationId ?? buildGenerationId(events, options.sourceEventLogBytes ?? 0, options.sourceEventLogMtimeMs ?? 0);
   const sourceEventLogBytes = options.sourceEventLogBytes ?? 0;
   const sourceEventLogMtimeMs = options.sourceEventLogMtimeMs ?? 0;
 
   for (const event of events) {
+    if (!admitEvent(event, seenEventKeys)) {
+      continue;
+    }
     if (event.type === "friction.signal") {
       const occurrence = occurrenceFromSignal(event);
       const id = occurrence.frictionId;
@@ -588,9 +592,45 @@ function occurrenceFromSignal(event) {
   };
 }
 
+function eventDedupeKey(event) {
+  // A single tool invocation has a single outcome. Several extension hosts can
+  // join one session and each one observes and appends that outcome, and two
+  // classification paths can record the same failure with different detail
+  // text, so the tool call id plus the symptom is the true identity whenever
+  // the host supplies a call id. The session is part of the key so that a
+  // reused call id can never merge two sessions. Measured against a 15481
+  // signal log this merges 356 groups, costs nothing against a session-free
+  // key, and the widest merged group spans 67 ms.
+  const callId = event?.signal?.evidence?.toolCallId;
+  if (callId) {
+    return `call\u0000${callId}\u0000${event.sessionId ?? ""}\u0000${event.signal?.kind ?? ""}\u0000${event.signal?.title ?? ""}`;
+  }
+  // Without a call id the only safe identity is the whole event. The key is id
+  // plus timestamp, not id alone, because classifyToolFailure omits the
+  // timestamp from stableId when failure details are present, so two genuinely
+  // distinct failures can share an id and only their at values separate them.
+  return `event\u0000${event.id}\u0000${event.at ?? ""}`;
+}
+
+function admitEvent(event, seenEventKeys) {
+  if (!event?.id) {
+    return true;
+  }
+  const key = eventDedupeKey(event);
+  if (seenEventKeys.has(key)) {
+    return false;
+  }
+  seenEventKeys.add(key);
+  return true;
+}
+
 function buildOccurrences(events) {
   const occurrences = [];
+  const seenEventKeys = new Set();
   for (const event of events) {
+    if (!admitEvent(event, seenEventKeys)) {
+      continue;
+    }
     if (event.type === "friction.signal") {
       occurrences.push(occurrenceFromSignal(event));
     }
@@ -624,6 +664,19 @@ function normalizeEvent(event, options) {
   }
   if (!event.type) {
     throw new Error("event.type is required");
+  }
+  if (options.now !== undefined && typeof options.now !== "string") {
+    throw new Error(`the now option must be an ISO timestamp string, received ${typeof options.now}`);
+  }
+  // options.now is a clock for events that carry no timestamp of their own. It
+  // must never overwrite a timestamp the classifier already stamped, because
+  // that timestamp is a recorded fact and the clock is not. Refuse the
+  // ambiguous call instead of ignoring the argument. Silently ignoring it hid
+  // the occurrence amplification defect: callers appended one already stamped
+  // signal twice with two different now values and believed they had recorded
+  // two occurrences.
+  if (options.now && event.at && options.now !== event.at) {
+    throw new Error(`event.at ${event.at} conflicts with the now option ${options.now}; pass the timestamp when the event is built rather than at append time`);
   }
   const at = event.at ?? options.now ?? new Date().toISOString();
   return {

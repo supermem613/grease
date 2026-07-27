@@ -3,6 +3,16 @@ import { buildBrief } from "./brief.mjs";
 import { classifyManualCapture } from "./classifier.mjs";
 
 export function createGreaseTools(options = {}) {
+  // options.now is a clock FUNCTION used to stamp events. The store layer takes
+  // a timestamp string, so the clock is resolved here and never forwarded as a
+  // function. Forwarding it made appendEvent compare a function against
+  // event.at and made updateFriction write the function into event.at, where
+  // JSON.stringify silently dropped it and left the event with no timestamp.
+  const { now: clock, ...storeOptions } = options;
+  const storeOptionsAtNow = () => {
+    const now = clock?.();
+    return now === undefined ? storeOptions : { ...storeOptions, now };
+  };
   return [
     {
       name: "grease_status",
@@ -12,7 +22,7 @@ export function createGreaseTools(options = {}) {
         properties: {}
       },
       handler: async () => {
-        const summary = await readCatalogSummary(options);
+        const summary = await readCatalogSummary(storeOptions);
         return success("grease_status", summary);
       }
     },
@@ -62,10 +72,11 @@ export function createGreaseTools(options = {}) {
         const event = classifyManualCapture(args, {
           sessionId: invocation?.sessionId,
           sessionName: sessionNameFrom(invocation),
-          now: options.now?.()
+          toolCallId: toolCallIdFrom(invocation),
+          now: clock?.()
         });
-        const result = await appendEvent(event, options);
-        const catalog = await readCatalog(options);
+        const result = await appendEvent(event, storeOptions);
+        const catalog = await readCatalog(storeOptions);
         return success("grease_capture", {
           eventId: result.event.id,
           itemCount: catalog.items.length
@@ -84,7 +95,7 @@ export function createGreaseTools(options = {}) {
         }
       },
       handler: async (args) => {
-        const result = await searchCatalog(args, options);
+        const result = await searchCatalog(args, storeOptions);
         return success("grease_search", {
           items: result.items
         });
@@ -101,7 +112,7 @@ export function createGreaseTools(options = {}) {
         required: ["id"]
       },
       handler: async (args) => {
-        return success("grease_get", await getFriction(args.id, options));
+        return success("grease_get", await getFriction(args.id, storeOptions));
       }
     },
     {
@@ -121,13 +132,13 @@ export function createGreaseTools(options = {}) {
       handler: async (args) => {
         const { id, ids, ...updates } = args;
         if (Array.isArray(ids) && ids.length > 0) {
-          const result = await updateFrictionBulk(ids, updates, options);
+          const result = await updateFrictionBulk(ids, updates, storeOptionsAtNow());
           return success("grease_update", {
             itemIds: result.ids,
             itemCount: result.catalog.items.length
           });
         }
-        const result = await updateFriction(id, updates, options);
+        const result = await updateFriction(id, updates, storeOptionsAtNow());
         return success("grease_update", {
           eventId: result.event.id,
           itemCount: result.catalog.items.length
@@ -147,7 +158,7 @@ export function createGreaseTools(options = {}) {
         }
       },
       handler: async (args) => {
-        return success("grease_brief", await buildBrief(args, options));
+        return success("grease_brief", await buildBrief(args, storeOptions));
       }
     }
   ];
@@ -169,6 +180,20 @@ function sessionNameFrom(invocation) {
     ?? invocation?.sessionTitle
     ?? invocation?.projectSessionName
     ?? invocation?.conversationTitle;
+  if (typeof value === "string" && value.trim() !== "") {
+    return value.trim();
+  }
+  return undefined;
+}
+
+function toolCallIdFrom(invocation) {
+  // Only fields that name a specific invocation are accepted. A generic id is
+  // deliberately excluded: if it were the session or extension id, every repeat
+  // of one friction inside a session would collapse into a single occurrence
+  // and never be counted again.
+  const value = invocation?.toolCallId
+    ?? invocation?.callId
+    ?? invocation?.invocationId;
   if (typeof value === "string" && value.trim() !== "") {
     return value.trim();
   }

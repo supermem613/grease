@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import * as catalogStore from "../.github/extensions/grease/core/catalog.mjs";
 import { appendEvent, buildCatalog, getFriction, pathsForStore, readCatalog, readEvents, searchCatalog, updateFriction } from "../.github/extensions/grease/core/catalog.mjs";
 import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
-import { classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
+import { classifyManualCapture, classifySessionEvent } from "../.github/extensions/grease/core/classifier.mjs";
 
 test("grease pr1 decouple capture: append leaves projections byte-identical and first stale read repairs", async () => {
   const root = await tempRoot();
@@ -22,7 +22,7 @@ test("grease pr1 decouple capture: append leaves projections byte-identical and 
       sessionName: "Seed Session",
       workingDirectory: "C:\\repo"
     });
-    const seed = await appendEvent(seedSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+    const seed = await appendEvent(occurredAt(seedSignal, "2026-06-09T12:00:00.000Z"), { root });
 
     const paths = pathsForStore(root);
     const beforeCatalogBytes = await readFile(paths.catalog, "utf8");
@@ -37,7 +37,7 @@ test("grease pr1 decouple capture: append leaves projections byte-identical and 
       sessionName: "Follow Up Session",
       workingDirectory: "C:\\repo"
     });
-    const appended = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:00:01.000Z" });
+    const appended = await appendEvent(occurredAt(followUpSignal, "2026-06-09T12:00:01.000Z"), { root });
 
     const lines = (await readFile(paths.events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
     assert.equal(lines.length, 2);
@@ -84,8 +84,8 @@ test("grease pr2 bounded projection: occurrences reconstructed from log and vers
     });
     firstSignal.at = "2026-06-09T12:00:00.000Z";
     secondSignal.at = "2026-06-09T12:01:00.000Z";
-    await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "box-1" });
-    await appendEvent(secondSignal, { root, now: "2026-06-09T12:01:00.000Z", machineName: "box-2" });
+    await appendEvent(occurredAt(firstSignal, "2026-06-09T12:00:00.000Z"), { root, machineName: "box-1" });
+    await appendEvent(occurredAt(secondSignal, "2026-06-09T12:01:00.000Z"), { root, machineName: "box-2" });
 
     const paths = pathsForStore(root);
     const catalog = await readCatalog({ root });
@@ -220,7 +220,7 @@ test("grease pr3 lock ownership: non-owner release cannot delete a reclaimed loc
       sessionName: "PR3 Dead Owner",
       workingDirectory: "C:\\repo"
     });
-    const appended = await appendEvent(deadOwnerSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+    const appended = await appendEvent(occurredAt(deadOwnerSignal, "2026-06-09T12:00:00.000Z"), { root });
     assert.ok(appended.event.id, "pr3: a write reclaims a dead-owner lock and proceeds");
     assert.equal(await pathExists(lockPath), false, "pr3: the reclaimed lock is released after the write");
     const events = await readEvents({ root });
@@ -246,7 +246,7 @@ test("grease pr5 split locks: capture proceeds during rebuild and concurrent sta
   };
   try {
     for (let index = 0; index < 60; index += 1) {
-      await appendEvent(signalFor(index), { root, now: `2026-06-09T12:${String(index % 60).padStart(2, "0")}:00.000Z` });
+      await appendEvent(occurredAt(signalFor(index), `2026-06-09T12:${String(index % 60).padStart(2, "0")}:00.000Z`), { root });
     }
     await readCatalog({ root });
 
@@ -262,7 +262,7 @@ test("grease pr5 split locks: capture proceeds during rebuild and concurrent sta
     );
     let capturedDuringRebuild;
     try {
-      capturedDuringRebuild = await appendEvent(signalFor(60), { root, now: "2026-06-09T13:00:00.000Z" });
+      capturedDuringRebuild = await appendEvent(occurredAt(signalFor(60), "2026-06-09T13:00:00.000Z"), { root });
     } finally {
       await rm(projectionLock, { recursive: true, force: true });
     }
@@ -278,7 +278,7 @@ test("grease pr5 split locks: capture proceeds during rebuild and concurrent sta
 
     await catalogStore.rebuildCatalog({ root });
 
-    await appendEvent(signalFor(61), { root, now: "2026-06-09T13:01:00.000Z" });
+    await appendEvent(occurredAt(signalFor(61), "2026-06-09T13:01:00.000Z"), { root });
     const [firstReader, secondReader] = await Promise.all([
       readCatalog({ root }),
       readCatalog({ root })
@@ -325,7 +325,7 @@ test("grease pr4 temp sweeper: stray projection tmp removed under lock while unr
       sessionName: "PR4 Seed",
       workingDirectory: "C:\\repo"
     });
-    const seeded = await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z" });
+    const seeded = await appendEvent(occurredAt(firstSignal, "2026-06-09T12:00:00.000Z"), { root });
 
     const strayCatalogTmp = path.join(root, `catalog.json.${process.pid}.100.0.tmp`);
     const strayActiveTmp = path.join(root, `active.json.${process.pid}.100.1.tmp`);
@@ -347,7 +347,7 @@ test("grease pr4 temp sweeper: stray projection tmp removed under lock while unr
       sessionName: "PR4 Follow Up",
       workingDirectory: "C:\\repo"
     });
-    const followUp = await appendEvent(followUpSignal, { root, now: "2026-06-09T12:05:00.000Z" });
+    const followUp = await appendEvent(occurredAt(followUpSignal, "2026-06-09T12:05:00.000Z"), { root });
 
     assert.equal(
       await pathExists(strayCatalogTmp),
@@ -415,8 +415,8 @@ test("append-only log is source of truth for compacted catalog", async () => {
     first.at = "2026-06-09T12:00:00.000Z";
     second.at = "2026-06-09T12:01:00.000Z";
 
-    await appendEvent(first, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
-    await appendEvent(second, { root, now: "2026-06-09T12:01:00.000Z", machineName: "devbox-2" });
+    await appendEvent(occurredAt(first, "2026-06-09T12:00:00.000Z"), { root, machineName: "devbox-1" });
+    await appendEvent(occurredAt(second, "2026-06-09T12:01:00.000Z"), { root, machineName: "devbox-2" });
     const events = await readEvents({ root });
     const catalog = await readCatalog({ root });
 
@@ -653,7 +653,7 @@ test("same-size event log rewrite rebuilds active projection with updated metada
       sessionName: "Rewrite Session",
       workingDirectory: "C:\\repo"
     });
-    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await appendEvent(occurredAt(signal, "2026-06-09T12:00:00.000Z"), { root });
 
     const initialActive = await catalogStore.readActiveCatalog({ root });
     const paths = pathsForStore(root);
@@ -726,7 +726,7 @@ test("transient tail parse errors wait for a locked repair before returning the 
       workingDirectory: "C:\\repo"
     });
 
-    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await appendEvent(occurredAt(signal, "2026-06-09T12:00:00.000Z"), { root });
     await catalogStore.readActiveCatalog({ root });
 
     const paths = pathsForStore(root);
@@ -782,7 +782,7 @@ test("active projection write failure preserves durable capture and falls back t
 
     const warningPromise = new Promise((resolve) => process.once("warning", (warning) => resolve(warning)));
 
-    const appendResult = await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
+    const appendResult = await appendEvent(occurredAt(signal, "2026-06-09T12:00:00.000Z"), { root, machineName: "devbox-1" });
     const warning = await warningPromise;
 
     assert.equal(appendResult.event.signal.title, signal.signal.title);
@@ -828,7 +828,7 @@ test("read-triggered active rebuild failure returns full-catalog fallback", { sk
       workingDirectory: "C:\\repo"
     });
 
-    await appendEvent(firstSignal, { root, now: "2026-06-09T12:00:00.000Z", machineName: "devbox-1" });
+    await appendEvent(occurredAt(firstSignal, "2026-06-09T12:00:00.000Z"), { root, machineName: "devbox-1" });
 
     const paths = pathsForStore(root);
     const initialProjection = await catalogStore.readActiveCatalog({ root });
@@ -936,7 +936,23 @@ async function seedActiveProjectionItems(root) {
   }, {
     sessionId: "session-open",
     sessionName: "Open Session",
-    workingDirectory: "C:\\repo"
+    workingDirectory: "C:\\repo",
+    now: "2026-06-09T12:00:00.000Z"
+  });
+  // A repeat occurrence is a second event with its own timestamp. It shares the
+  // event id, because classifyToolFailure omits the timestamp from stableId
+  // when failure details are present, so only the timestamp separates the two.
+  // appendEvent keeps an already-stamped event.at, so its now option cannot
+  // turn one signal object into two occurrences.
+  const [openSignalRepeat] = classifySessionEvent("tool.execution_complete", {
+    success: false,
+    toolName: "active-open",
+    error: "Open issue"
+  }, {
+    sessionId: "session-open",
+    sessionName: "Open Session",
+    workingDirectory: "C:\\repo",
+    now: "2026-06-09T12:00:30.000Z"
   });
   const [triagedSignal] = classifySessionEvent("tool.execution_complete", {
     success: false,
@@ -975,12 +991,12 @@ async function seedActiveProjectionItems(root) {
     workingDirectory: "C:\\repo"
   });
 
-  await appendEvent(openSignal, { root, now: "2026-06-09T12:00:00.000Z" });
-  await appendEvent(openSignal, { root, now: "2026-06-09T12:00:30.000Z" });
-  await appendEvent(triagedSignal, { root, now: "2026-06-09T12:01:00.000Z" });
-  await appendEvent(inProgressSignal, { root, now: "2026-06-09T12:02:00.000Z" });
-  await appendEvent(resolvedSignal, { root, now: "2026-06-09T12:03:00.000Z" });
-  await appendEvent(ignoredSignal, { root, now: "2026-06-09T12:04:00.000Z" });
+  await appendEvent(occurredAt(openSignal, "2026-06-09T12:00:00.000Z"), { root });
+  await appendEvent(occurredAt(openSignalRepeat, "2026-06-09T12:00:30.000Z"), { root });
+  await appendEvent(occurredAt(triagedSignal, "2026-06-09T12:01:00.000Z"), { root });
+  await appendEvent(occurredAt(inProgressSignal, "2026-06-09T12:02:00.000Z"), { root });
+  await appendEvent(occurredAt(resolvedSignal, "2026-06-09T12:03:00.000Z"), { root });
+  await appendEvent(occurredAt(ignoredSignal, "2026-06-09T12:04:00.000Z"), { root });
 
   const open = (await searchCatalog({ query: "active-open" }, { root })).items[0];
   const triaged = (await searchCatalog({ query: "active-triaged" }, { root })).items[0];
@@ -1033,7 +1049,7 @@ test("a rebuild claims the store lock that a concurrent release is vacating", as
       sessionName: "Lock Handoff",
       workingDirectory: "C:\\repo"
     });
-    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await appendEvent(occurredAt(signal, "2026-06-09T12:00:00.000Z"), { root });
 
     // releaseStoreLock renames the lock to a tombstone before removing it, and
     // on Windows a claim landing inside that window sees EPERM instead of
@@ -1071,7 +1087,7 @@ test("a failed projection write rejects its caller and leaves the queue serving 
       sessionName: "Queue Failure",
       workingDirectory: "C:\\repo"
     });
-    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await appendEvent(occurredAt(signal, "2026-06-09T12:00:00.000Z"), { root });
 
     const catalogFile = pathsForStore(root).catalog;
     await rm(catalogFile, { recursive: true, force: true });
@@ -1098,9 +1114,163 @@ test("a failed projection write rejects its caller and leaves the queue serving 
   }
 });
 
+function occurredAt(signal, at) {
+  // appendEvent refuses a now option that disagrees with an already stamped
+  // event, so a test that wants a specific occurrence time must stamp the
+  // signal where it is built. This returns a copy so that stamping one signal
+  // twice yields two events rather than two references to one event.
+  return { ...signal, at };
+}
+
 async function tempRoot() {
   return mkdtemp(path.join(os.tmpdir(), "grease-test-"));
 }
+
+test("byte-identical delivery of one event counts as a single occurrence", async () => {
+  // Several extension hosts can join the same session, and each one handles the
+  // same invocation and appends its own line. The log stays authoritative and
+  // keeps every line; the projection must still count one delivered event once,
+  // or every occurrence count inflates by the number of live hosts.
+  const root = await tempRoot();
+  try {
+    const captured = classifyManualCapture(
+      {
+        title: "duplicate delivery",
+        summary: "one invocation delivered to several hosts",
+        severity: "low",
+        kind: "tool-failure",
+        source: "unit",
+        evidence: "n/a"
+      },
+      { sessionId: "session-dup", workingDirectory: "C:\\repo", now: "2026-07-27T00:00:00.000Z" }
+    );
+
+    for (let i = 0; i < 8; i += 1) {
+      await appendEvent(captured, { root });
+    }
+
+    const lines = (await readFile(pathsForStore(root).events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 8, "the append-only log must keep every delivered line");
+    assert.equal(new Set(lines.map((line) => JSON.parse(line).id)).size, 1, "all eight lines carry one event id");
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1);
+    assert.equal(catalog.items[0].occurrenceCount, 1, "one distinct event id is one occurrence");
+
+    const reconstructed = await getFriction(catalog.items[0].id, { root });
+    assert.equal(reconstructed.occurrences.length, 1, "reconstructed occurrences dedupe by event id too");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("distinct event ids sharing a fingerprint still count separately", async () => {
+  // Guards the dedupe from over-reaching. Two real occurrences of the same
+  // friction are distinct events, so they must still add up.
+  const root = await tempRoot();
+  try {
+    for (const now of ["2026-07-27T00:00:00.000Z", "2026-07-27T00:00:01.000Z"]) {
+      const captured = classifyManualCapture(
+        {
+          title: "recurring friction",
+          summary: "same symptom seen twice",
+          severity: "low",
+          kind: "tool-failure",
+          source: "unit",
+          evidence: "n/a"
+        },
+        { sessionId: "session-real", workingDirectory: "C:\\repo", now }
+      );
+      await appendEvent(captured, { root });
+    }
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1);
+    assert.equal(catalog.items[0].occurrenceCount, 2, "two distinct events remain two occurrences");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one tool call observed by several hosts is a single occurrence", async () => {
+  // A tool invocation has one outcome. Several extension hosts each observe and
+  // append it, and each host stamps its own timestamp, so the call id plus the
+  // symptom is the only identity that survives duplicate delivery.
+  const root = await tempRoot();
+  try {
+    const failure = { success: false, toolName: "flaky", error: "Boom", toolCallId: "call-1" };
+    for (const at of ["2026-07-27T00:00:00.100Z", "2026-07-27T00:00:00.101Z", "2026-07-27T00:00:00.102Z"]) {
+      const [signal] = classifySessionEvent("tool.execution_complete", failure, { sessionId: "session-hosts", workingDirectory: "C:\\repo" });
+      await appendEvent(occurredAt(signal, at), { root });
+    }
+
+    const lines = (await readFile(pathsForStore(root).events, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+    assert.equal(lines.length, 3, "the append-only log keeps every delivered line");
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1);
+    assert.equal(catalog.items[0].occurrenceCount, 1, "one tool call is one occurrence");
+
+    const [second] = classifySessionEvent("tool.execution_complete", { ...failure, toolCallId: "call-2" }, { sessionId: "session-hosts", workingDirectory: "C:\\repo" });
+    await appendEvent(occurredAt(second, "2026-07-27T00:05:00.000Z"), { root });
+
+    const afterSecondCall = await readCatalog({ root });
+    assert.equal(afterSecondCall.items.length, 1);
+    assert.equal(afterSecondCall.items[0].occurrenceCount, 2, "a second tool call is a second occurrence");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one capture invocation delivered to several hosts is a single occurrence", async () => {
+  const root = await tempRoot();
+  try {
+    const input = {
+      title: "captured once",
+      summary: "one invocation, several hosts",
+      severity: "low",
+      kind: "tool-failure",
+      source: "unit",
+      evidence: "n/a"
+    };
+    for (const now of ["2026-07-27T00:00:00.306Z", "2026-07-27T00:00:00.307Z", "2026-07-27T00:00:00.308Z"]) {
+      await appendEvent(classifyManualCapture(input, { sessionId: "session-capture", workingDirectory: "C:\\repo", toolCallId: "call-capture", now }), { root });
+    }
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1);
+    assert.equal(catalog.items[0].occurrenceCount, 1, "one capture call is one occurrence");
+
+    await appendEvent(classifyManualCapture(input, { sessionId: "session-capture", workingDirectory: "C:\\repo", toolCallId: "call-capture-2", now: "2026-07-27T00:09:00.000Z" }), { root });
+    const afterSecondCapture = await readCatalog({ root });
+    assert.equal(afterSecondCapture.items[0].occurrenceCount, 2, "a second capture call is a second occurrence");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("appendEvent records the event timestamp and refuses a conflicting now option", async () => {
+  const root = await tempRoot();
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", { success: false, toolName: "clock", error: "Boom", toolCallId: "call-clock" }, { sessionId: "session-clock" });
+    const stamped = occurredAt(signal, "2026-07-27T08:00:00.000Z");
+
+    const appended = await appendEvent(stamped, { root, now: "2026-07-27T08:00:00.000Z" });
+    assert.equal(appended.event.at, "2026-07-27T08:00:00.000Z", "an agreeing now option leaves the event timestamp intact");
+
+    await assert.rejects(
+      () => appendEvent(stamped, { root, now: "2026-07-27T09:00:00.000Z" }),
+      /conflicts with the now option/,
+      "a now option that disagrees with the event timestamp is refused rather than ignored"
+    );
+
+    const undated = { type: "friction.update", itemId: "nobody", updates: {} };
+    const clocked = await appendEvent(undated, { root, now: "2026-07-27T10:00:00.000Z" });
+    assert.equal(clocked.event.at, "2026-07-27T10:00:00.000Z", "now still supplies the timestamp for an event that carries none");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function runNodeModule(source) {
   return new Promise((resolve, reject) => {

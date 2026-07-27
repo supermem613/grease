@@ -141,7 +141,7 @@ test("grease brief surfaces extension-name-resolution guidance for extensions_ma
       sessionName: "Extension name session",
       workingDirectory: "C:\\repo"
     });
-    await appendEvent(signal, { root, now: "2026-06-10T12:00:00.000Z" });
+    await appendEvent({ ...signal, at: "2026-06-10T12:00:00.000Z" }, { root });
 
     const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
     const search = await callTool(tools.get("grease_search"), {
@@ -175,7 +175,7 @@ test("grease status tool preserves its public result shape from the active summa
       sessionName: "Status Session",
       workingDirectory: "C:\\repo"
     });
-    await appendEvent(signal, { root, now: "2026-06-09T12:00:00.000Z" });
+    await appendEvent({ ...signal, at: "2026-06-09T12:00:00.000Z" }, { root });
 
     const { items } = await searchCatalog({ query: "status-open" }, { root });
     assert.equal(items.length, 1);
@@ -228,3 +228,47 @@ async function callTool(tool, args) {
   assert.equal(result.resultType, "success");
   return JSON.parse(result.textResultForLlm);
 }
+
+test("an injected clock stamps captures and updates without reaching the store layer", async () => {
+  // createGreaseTools takes now as a clock function while the store layer takes
+  // a timestamp string. Forwarding the function to the store wrote it into
+  // event.at, where JSON.stringify dropped it and left the event undated.
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root, now: () => "2026-07-27T06:00:00.000Z" }).map((tool) => [tool.name, tool]));
+
+    const capture = await callTool(tools.get("grease_capture"), {
+      title: "Clock seam",
+      summary: "An injected clock must stamp the captured event",
+      severity: "low",
+      kind: "tool-failure",
+      source: "test",
+      evidence: "Capture through the tool with an injected clock"
+    });
+    assert.equal(capture.data.itemCount, 1);
+
+    await callTool(tools.get("grease_update"), { id: capture.data.eventId, status: "resolved" });
+
+    const events = (await readFile(pathsForStore(root).events, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.length, 2);
+    for (const event of events) {
+      assert.equal(event.at, "2026-07-27T06:00:00.000Z", "every event carries the injected timestamp");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the store layer refuses a clock function in place of a timestamp", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const [signal] = classifySessionEvent("tool.execution_complete", { success: false, toolName: "clock", error: "Boom" });
+    await assert.rejects(
+      () => appendEvent(signal, { root, now: () => "2026-07-27T06:00:00.000Z" }),
+      /now option must be an ISO timestamp string/,
+      "a non-string now is refused rather than written into the event"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
