@@ -117,7 +117,7 @@ function classifyToolFailure(data, context) {
   ].map((value) => summarizeValue(value, 1200)).filter(Boolean).join("\n");
   const details = [failureDetails, argumentDetails].filter(Boolean).join("\n");
   const kind = classifyFailureKind(toolName, failureDetails, data.arguments ?? data.toolArgs);
-  const title = titleForToolFailure(toolName, kind);
+  const title = titleForToolFailure(toolName, kind, failureDetails);
   const severity = severityForKind(kind);
   return [{
     type: "friction.signal",
@@ -128,7 +128,7 @@ function classifyToolFailure(data, context) {
     workingDirectory,
     signal: {
       kind,
-      source: classifyToolSource(toolName, data),
+      source: classifyToolSource(toolName),
       severity,
       title,
       summary: summarizeToolFailure(toolName, kind, details),
@@ -157,6 +157,7 @@ function classifyToolFailure(data, context) {
         failureDiagnosis: failureDiagnosisFor(toolName, kind, failureDetails, data.arguments ?? data.toolArgs, data.decisionContext),
         decisionContext: summarizeValue(data.decisionContext, 4000),
         error: summarizeValue(data.error, 2000),
+        errorSignature: errorSignature(failureDetails),
         result: summarizeValue(data.result ?? data.toolResult, 2000),
         arguments: summarizeValue(data.arguments ?? data.toolArgs, 2000),
         rawEvent: summarizeValue(data, 4000)
@@ -282,7 +283,7 @@ function classifyFailureKind(toolName, details, rawArguments) {
   if (TIMEOUT.test(haystack)) {
     return "timeout";
   }
-  if (isMcpTool(toolName, { details })) {
+  if (isMcpTool(toolName)) {
     return "mcp-error";
   }
   if (isLocalTool(toolName)) {
@@ -291,8 +292,8 @@ function classifyFailureKind(toolName, details, rawArguments) {
   return "tool-error";
 }
 
-function classifyToolSource(toolName, data) {
-  if (isMcpTool(toolName, data)) {
+export function classifyToolSource(toolName) {
+  if (isMcpTool(toolName)) {
     return "mcp";
   }
   if (isLocalTool(toolName)) {
@@ -306,13 +307,22 @@ function isLocalTool(toolName) {
   return LOCAL_TOOL_NAMES.has(normalized) || normalized.includes("powershell") || normalized.includes("terminal");
 }
 
-function isMcpTool(toolName, data) {
+function isMcpTool(toolName) {
+  // The tool name is the only reliable marker. This used to also search the
+  // call arguments for the word "atrium", so viewing any file under a path
+  // containing that word relabelled local tools such as view, edit, and
+  // powershell as MCP calls and split one friction across two sources.
   const normalized = String(toolName).toLowerCase();
-  const args = summarizeValue(data.arguments ?? data.toolArgs ?? data.details ?? "", 1000) ?? "";
-  return normalized.includes("mcp") || normalized.includes("atrium") || /\batrium\b/i.test(args);
+  return normalized.includes("mcp") || normalized.includes("atrium");
 }
 
-function titleForToolFailure(toolName, kind) {
+function titleForToolFailure(toolName, kind, failureDetails) {
+  const base = baseTitleForToolFailure(toolName, kind);
+  const signature = errorSignature(failureDetails);
+  return signature ? `${base}: ${signature}` : base;
+}
+
+function baseTitleForToolFailure(toolName, kind) {
   if (kind === "access-denied") {
     return `${toolName} hit access denied`;
   }
@@ -329,6 +339,61 @@ function titleForToolFailure(toolName, kind) {
     return `${toolName} local tool failed`;
   }
   return `${toolName} failed`;
+}
+
+// The stable part of an error is short prose. The variable part is a path, a
+// serialized payload, an echoed pattern, or an identifier, and including it in
+// the title splits one cause across many items. Dropping the error text
+// entirely does the opposite and lets one tool name absorb unrelated failures,
+// so the signature keeps the vocabulary and discards the payload.
+export function errorSignature(raw) {
+  if (raw === undefined || raw === null) {
+    return "";
+  }
+  let text = String(raw);
+  if (text.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      text = parsed.message ?? parsed.error ?? parsed.detail ?? text;
+    } catch {
+      // Payloads are truncated before they reach here, so a JSON envelope
+      // often arrives cut mid-string and cannot be parsed. The message is
+      // still the first field, so read it directly rather than losing it.
+      text = /"(?:message|error|detail)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(text)?.[1] ?? text;
+    }
+  }
+  // A Windows path carries a drive-letter colon, so paths must go before the
+  // text is split on colons or the drive letter survives as its own segment.
+  const stripped = String(text)
+    .replace(/[A-Za-z]:[\\/][^\s"'`]*/g, " ")
+    .replace(/(?:^|\s)[\\/](?:[\w.-]+[\\/])+[\w.-]*/g, " ");
+  const segments = stripped
+    .split(/[:\n]/)
+    .map((part) => part.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const kept = segments.filter((part) => !looksLikeEchoedInput(part));
+  // When every segment is payload there is no stable cause to name. Returning
+  // one arbitrary fragment would vary with payload shape and split the item,
+  // so the title stays plain instead.
+  return kept
+    .join(": ")
+    .replace(/\b[0-9a-f]{8,}\b/gi, "<id>")
+    .replace(/\b\d+\b/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function looksLikeEchoedInput(segment) {
+  const text = segment.trim();
+  if (text === "" || text.length > 60) {
+    return true;
+  }
+  if (/["`]/.test(text) || /[(){}[\]|*+?^$\\]/.test(text)) {
+    return true;
+  }
+  const letters = (text.match(/[A-Za-z]/g) ?? []).length;
+  return letters / text.length < 0.6;
 }
 
 function summarizeToolFailure(toolName, kind, details) {
@@ -348,7 +413,7 @@ function tagsForToolFailure(toolName, kind) {
   if (kind === "policy-block") {
     tags.push("guardrail");
   }
-  if (isMcpTool(toolName, {})) {
+  if (isMcpTool(toolName)) {
     tags.push("mcp");
   }
   if (isLocalTool(toolName)) {

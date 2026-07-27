@@ -3,6 +3,7 @@ import { scheduler } from "node:timers/promises";
 import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { classifyToolSource, errorSignature } from "./classifier.mjs";
 
 const CATALOG_VERSION = 6;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
@@ -583,13 +584,39 @@ function occurrenceFromSignal(event) {
     machineName: event.machineName ?? os.hostname(),
     workingDirectory: event.workingDirectory,
     kind: signal.kind ?? "unknown",
-    source: signal.source ?? "unknown",
+    source: sourceForProjection(signal),
     severity: signal.severity ?? "medium",
-    title: signal.title ?? "Friction captured",
+    title: titleForProjection(signal),
     summary: signal.summary ?? "",
     tags: signal.tags ?? [],
     evidence: signal.evidence ?? {}
   };
+}
+
+// A title is derived, not authored, so improvements to how a cause is named
+// must reach events that were already recorded. Signals classified before the
+// error signature existed carry a bare tool name such as "view failed", which
+// names no cause and would merge unrelated failures into one item. The
+// presence of evidence.errorSignature marks a signal whose title already
+// carries its cause, so it is returned untouched and never suffixed twice.
+// The source of a tool failure follows from the tool name alone. Signals
+// recorded earlier also searched the call arguments for an MCP server name, so
+// the same tool was filed under two sources depending on which file it touched.
+// Re-deriving here repairs those signals instead of stranding them. A manual
+// capture has no tool name and keeps the source its author gave it.
+function sourceForProjection(signal) {
+  const toolName = signal.evidence?.toolName;
+  return toolName ? classifyToolSource(toolName) : (signal.source ?? "unknown");
+}
+
+function titleForProjection(signal) {
+  const title = signal.title ?? "Friction captured";
+  const evidence = signal.evidence ?? {};
+  if (evidence.errorSignature !== undefined || !evidence.toolName) {
+    return title;
+  }
+  const signature = errorSignature(evidence.error ?? evidence.result);
+  return signature ? `${title}: ${signature}` : title;
 }
 
 function eventDedupeKey(event) {
@@ -688,12 +715,15 @@ function normalizeEvent(event, options) {
 }
 
 function fingerprintSignal(event) {
+  // The working directory is deliberately absent. The same friction seen from
+  // two repos is one friction, and including the directory split a single
+  // problem into one item per directory it was hit in. Each occurrence still
+  // records its own directory, and the item carries workingDirectories.
   const signal = event.signal ?? {};
   return hash([
     signal.kind,
-    signal.source,
-    signal.title,
-    event.workingDirectory,
+    sourceForProjection(signal),
+    titleForProjection(signal),
     signal.evidence?.toolName,
     signal.evidence?.resultType
   ]);

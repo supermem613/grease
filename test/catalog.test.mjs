@@ -1296,3 +1296,152 @@ function runNodeModule(source) {
     });
   });
 }
+
+test("the same failure in two working directories lands on one item", async () => {
+  // The working directory used to be part of the item identity, which split one
+  // friction into a separate item for every directory it was seen in. The
+  // directory survives on each occurrence, so nothing is lost by merging.
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const [first] = classifySessionEvent("tool.failure", {
+      toolName: "view",
+      error: "Path does not exist",
+      workingDirectory: "C:\\repos\\alpha"
+    });
+    const [second] = classifySessionEvent("tool.failure", {
+      toolName: "view",
+      error: "Path does not exist",
+      workingDirectory: "C:\\repos\\beta"
+    });
+    await appendEvent(occurredAt(first, "2026-07-27T01:00:00.000Z"), { root });
+    await appendEvent(occurredAt(second, "2026-07-27T02:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1, "one friction, seen in two directories, is one item");
+    assert.equal(catalog.items[0].occurrenceCount, 2);
+    assert.deepEqual(
+      [...catalog.items[0].workingDirectories].sort(),
+      ["C:\\repos\\alpha", "C:\\repos\\beta"],
+      "both directories are still reported on the merged item"
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("two different causes under one tool name stay on separate items", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const [missing] = classifySessionEvent("tool.failure", { toolName: "view", error: "Path does not exist" });
+    const [bounds] = classifySessionEvent("tool.failure", { toolName: "view", error: "view_range out of bounds" });
+    await appendEvent(occurredAt(missing, "2026-07-27T01:00:00.000Z"), { root });
+    await appendEvent(occurredAt(bounds, "2026-07-27T02:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 2, "unrelated causes are not absorbed into one tool-named item");
+    const titles = catalog.items.map((item) => item.title).sort();
+    assert.match(titles[0], /Path does not exist/);
+    assert.match(titles[1], /view_range out of bounds/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("a signal recorded before error signatures existed still gets its cause named at projection time", async () => {
+  // A title is derived, so a fix to how causes are named must reach events
+  // already on disk. These two signals carry the bare title the old classifier
+  // wrote and no errorSignature marker, which is how every historical event
+  // looks.
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const legacy = (error, at) => ({
+      type: "friction.signal",
+      id: `legacy-${at}`,
+      at,
+      sessionId: "s1",
+      workingDirectory: "C:\\repos\\alpha",
+      signal: {
+        kind: "tool-error",
+        source: "tool",
+        severity: "medium",
+        title: "view failed",
+        summary: "",
+        tags: [],
+        evidence: { toolName: "view", resultType: "error", error }
+      }
+    });
+    await appendEvent(legacy("Path does not exist: C:\\repos\\alpha\\gone.mjs", "2026-07-27T01:00:00.000Z"), { root });
+    await appendEvent(legacy("view_range out of bounds", "2026-07-27T02:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    const titles = catalog.items.map((item) => item.title).sort();
+    assert.equal(catalog.items.length, 2, "two causes under one legacy title are not merged into one item");
+    assert.match(titles[0], /^view failed: Path does not exist$/);
+    assert.match(titles[1], /^view failed: view_range out of bounds$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a signal that already carries its cause is not suffixed a second time", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const [signal] = classifySessionEvent("tool.failure", { toolName: "view", error: "Path does not exist" });
+    await appendEvent(occurredAt(signal, "2026-07-27T01:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items[0].title, "view failed: Path does not exist");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("a legacy signal filed under the wrong source is repaired at projection time", async () => {
+  // The old classifier read the call arguments, so the same view failure was
+  // filed under source "mcp" when the path happened to contain an MCP server
+  // name and under "tool" otherwise. Both are the same friction.
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const legacy = (source, at) => ({
+      type: "friction.signal",
+      id: `legacy-${at}`,
+      at,
+      sessionId: "s1",
+      signal: {
+        kind: "tool-error",
+        source,
+        severity: "medium",
+        title: "view failed",
+        summary: "",
+        tags: [],
+        evidence: { toolName: "view", resultType: "error", error: "Path does not exist" }
+      }
+    });
+    await appendEvent(legacy("mcp", "2026-07-27T01:00:00.000Z"), { root });
+    await appendEvent(legacy("tool", "2026-07-27T02:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items.length, 1, "one friction filed under two sources is one item");
+    assert.equal(catalog.items[0].source, "tool", "the source follows from the tool name");
+    assert.equal(catalog.items[0].occurrenceCount, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a manual capture keeps the source its author gave it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const signal = classifyManualCapture({
+      title: "The Shadow review protocol is unclear",
+      summary: "The review step names no reference file.",
+      source: "the-shadow REVIEW protocol",
+      kind: "missing-context",
+      severity: "medium"
+    });
+    await appendEvent(occurredAt(signal, "2026-07-27T01:00:00.000Z"), { root });
+
+    const catalog = await readCatalog({ root });
+    assert.equal(catalog.items[0].source, "the-shadow REVIEW protocol");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

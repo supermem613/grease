@@ -755,3 +755,84 @@ test("diagnoses missing file-backed MCP inputs", () => {
   assert.equal(diagnosis.childTool, "python");
   assert.match(diagnosis.fix, /pass inline stdin/);
 });
+
+test("a tool failure title carries the error cause, so one tool name does not absorb unrelated failures", () => {
+  const [missing] = classifySessionEvent("tool.failure", {
+    toolName: "view",
+    error: "Path does not exist: C:\\Users\\marcusm\\repos\\grease\\nope.mjs"
+  });
+  const [bounds] = classifySessionEvent("tool.failure", {
+    toolName: "view",
+    error: "view_range out of bounds"
+  });
+
+  assert.match(missing.signal.title, /^view failed: /);
+  assert.match(missing.signal.title, /Path does not exist/);
+  assert.match(bounds.signal.title, /view_range out of bounds/);
+  assert.notEqual(missing.signal.title, bounds.signal.title, "two causes under one tool get separate titles");
+});
+
+test("an error signature drops the path so the same failure on different paths shares a title", () => {
+  const [first] = classifySessionEvent("tool.failure", {
+    toolName: "atrium-grep",
+    error: JSON.stringify({ message: "MCP server 'atrium': invalid root: C:\\Users\\marcusm\\repos\\soda", code: "failure" })
+  });
+  const [second] = classifySessionEvent("tool.failure", {
+    toolName: "atrium-grep",
+    error: JSON.stringify({ message: "MCP server 'atrium': invalid root: C:\\Users\\marcusm\\repos\\kb", code: "failure" })
+  });
+
+  assert.equal(first.signal.title, second.signal.title, "the varying root path is stripped from the identity");
+  assert.match(first.signal.title, /invalid root/);
+});
+
+test("an error signature drops the echoed pattern but keeps the parse failure that names the cause", () => {
+  const [unclosed] = classifySessionEvent("tool.failure", {
+    toolName: "atrium-grep",
+    error: "fatal search error: invalid pattern: regex parse error:\n    (?:alpha|beta()\n    ^\nerror: unclosed group"
+  });
+  const [charClass] = classifySessionEvent("tool.failure", {
+    toolName: "atrium-grep",
+    error: "fatal search error: invalid pattern: regex parse error:\n    (?:[a&&[b])\n    ^\nerror: unclosed character class"
+  });
+
+  assert.match(unclosed.signal.title, /unclosed group/);
+  assert.match(charClass.signal.title, /unclosed character class/);
+  assert.equal(unclosed.signal.title.includes("alpha"), false, "the echoed pattern is not part of the identity");
+});
+
+test("a failure with no error text keeps the plain tool title", () => {
+  const [signal] = classifySessionEvent("tool.failure", { toolName: "view" });
+  assert.equal(signal.signal.title, "view failed");
+});
+
+test("a local tool is classified local even when its arguments mention an MCP server by name", () => {
+  // isMcpTool used to search the argument text for "atrium", so viewing any
+  // file under a path containing that word relabelled view as an MCP tool and
+  // split one friction across two sources.
+  const [mentions] = classifySessionEvent("tool.failure", {
+    toolName: "view",
+    error: "Path does not exist",
+    arguments: { path: "C:\\Users\\marcusm\\repos\\atrium\\src\\index.ts" }
+  });
+  const [plain] = classifySessionEvent("tool.failure", {
+    toolName: "view",
+    error: "Path does not exist",
+    arguments: { path: "C:\\Users\\marcusm\\repos\\grease\\src\\index.ts" }
+  });
+
+  assert.equal(mentions.signal.source, plain.signal.source, "the argument text does not change the tool source");
+  assert.equal(mentions.signal.kind, plain.signal.kind, "the argument text does not change the failure kind");
+  assert.notEqual(mentions.signal.source, "mcp");
+  assert.notEqual(mentions.signal.kind, "mcp-error");
+});
+
+test("a tool named for an MCP server is still classified as an MCP call", () => {
+  const [signal] = classifySessionEvent("tool.failure", {
+    toolName: "atrium-grep",
+    error: "MCP server 'atrium': invalid root"
+  });
+
+  assert.equal(signal.signal.source, "mcp");
+  assert.equal(signal.signal.kind, "mcp-error");
+});

@@ -54,6 +54,14 @@ Grease stores data under `~\.grease` by default:
 
 Capture never rewrites a projection. Each capture appends one line to `events.jsonl` and returns. A projection refresh happens off the hot path and only when the projection is actually stale, so a large catalog no longer pays a multi-megabyte rewrite on every event.
 
+### Derived item identity
+
+An item is one friction, and its identity comes from the failure kind, the tool source, the title, the tool name, and the result type. The working directory is deliberately absent, so the same failure hit from two repos is one item rather than two. Every occurrence still records the directory it happened in, and the item carries a `workingDirectories` array.
+
+A tool-failure title names its cause, not just the tool. Grease reduces the raw error to a short signature by discarding the parts that vary between two instances of the same failure, which are file paths, serialized payloads, echoed patterns, identifiers, and digits. `view failed` becomes `view failed: Path does not exist`, and `view failed: view_range out of bounds` stays a separate item instead of being absorbed into it.
+
+The title and the source are derived on read rather than trusted from the stored event, so an improvement to how a cause is named reaches friction that was recorded before the improvement existed. A signal carrying `evidence.errorSignature` was already named at capture time and is left untouched.
+
 ### Bounded projections
 
 Projections no longer persist a per-item `occurrences[]` array, so `catalog.json` and `active.json` stay bounded in size as the log grows. Each item keeps a single `item.latestOccurrence`. When a caller needs the full occurrence history, Grease reconstructs it on read from `events.jsonl`. `CATALOG_VERSION` is `6`; an older projection triggers a one-time rebuild into the bounded shape.
