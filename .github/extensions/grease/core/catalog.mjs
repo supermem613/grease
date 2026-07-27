@@ -386,7 +386,8 @@ export async function searchCatalog(query = {}, options = {}) {
     : await readCatalog(options);
   const text = String(query.query ?? "").toLowerCase();
   const limit = Number.isInteger(query.limit) ? query.limit : 25;
-  const items = catalog.items
+  const offset = Number.isInteger(query.offset) && query.offset > 0 ? query.offset : 0;
+  const matched = catalog.items
     .filter((item) => !status || item.status === status)
     .filter((item) => {
       if (!text) {
@@ -409,9 +410,13 @@ export async function searchCatalog(query = {}, options = {}) {
         ...(item.tags ?? [])
       ].join("\n").toLowerCase().includes(text);
     })
-    .sort(sortItems)
-    .slice(0, Math.max(1, Math.min(limit, 100)));
-  return { catalog, items };
+    .sort(sortItems);
+  // The clamp bounds one page, not what a caller can reach. Paging happens
+  // after the filter and the sort, so it applies to the active projection and
+  // the full catalog alike.
+  const pageSize = Math.max(1, Math.min(limit, 100));
+  const items = matched.slice(offset, offset + pageSize);
+  return { catalog, items, total: matched.length, offset, hasMore: offset + items.length < matched.length };
 }
 
 export async function getFriction(id, options = {}) {

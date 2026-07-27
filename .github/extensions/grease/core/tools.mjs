@@ -32,7 +32,8 @@ const UPDATE_RULES = [
 const SEARCH_RULES = [
   { field: "query", type: "string" },
   { field: "status", type: "string" },
-  { field: "limit", type: "number" }
+  { field: "limit", type: "number" },
+  { field: "offset", type: "number" }
 ];
 
 const BRIEF_RULES = [
@@ -135,7 +136,8 @@ export function createGreaseTools(options = {}) {
         properties: {
           query: { type: "string" },
           status: { type: "string" },
-          limit: { type: "number" }
+          limit: { type: "number", description: "Page size, clamped to 100. Defaults to 25." },
+          offset: { type: "number", description: "How many matches to skip. Page through the full result set with offset plus limit until hasMore is false." }
         }
       },
       handler: async (args) => {
@@ -145,7 +147,10 @@ export function createGreaseTools(options = {}) {
         }
         const result = await searchCatalog(args, storeOptions);
         return success("grease_search", {
-          items: result.items
+          items: result.items,
+          total: result.total,
+          offset: result.offset,
+          hasMore: result.hasMore
         });
       }
     },

@@ -8,7 +8,7 @@ const registry = [
   command(["schema"], "Emit the Grease command catalog.", "read"),
   command(["doctor"], "Run Grease health checks.", "read"),
   command(["status"], "Show catalog counts and paths.", "read"),
-  command(["search"], "Search friction items.", "read", ["query"], ["--status", "--limit"]),
+  command(["search"], "Search friction items.", "read", ["query"], ["--status", "--limit", "--offset"]),
   command(["get"], "Get one friction item with occurrences.", "read", ["id"]),
   command(["update"], "Update one or more friction items.", "mutate-local", ["id"], ["--status", "--severity", "--tag", "--note"]),
   command(["brief"], "Generate a kickoff prompt from friction items.", "read", [], ["--id", "--query", "--status", "--limit"])
@@ -53,9 +53,15 @@ async function dispatch(name, argv) {
     const result = await searchCatalog({
       query: parsed.positionals.join(" ") || parsed.flags.query,
       status: parsed.flags.status,
-      limit: numberFlag(parsed.flags.limit)
+      limit: numberFlag(parsed.flags.limit),
+      offset: numberFlag(parsed.flags.offset)
     });
-    return ok("search", { items: result.items });
+    return ok("search", {
+      items: result.items,
+      total: result.total,
+      offset: result.offset,
+      hasMore: result.hasMore
+    });
   }
   if (name === "get") {
     const id = parsed.positionals[0];

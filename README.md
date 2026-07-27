@@ -86,12 +86,14 @@ The extension registers these six tools:
 | --- | --- |
 | `grease_status` | Show catalog health and paths. |
 | `grease_capture` | Capture model-observed operational friction that passive telemetry may not see. |
-| `grease_search` | Search catalog items. |
+| `grease_search` | Search catalog items, one page at a time. |
 | `grease_get` | Inspect one item with evidence. |
 | `grease_update` | Change status, severity, tags, or note on one item (`id`) or many items at once (`ids`). |
 | `grease_brief` | Generate a kickoff prompt from one or more items. |
 
 Every tool reports a rejected call as a normal result whose payload carries `ok: false`, a `problems` array naming each offending argument, and a `recovery` line. Missing arguments, wrong types, and values outside an accepted set are all reported together, so a caller fixes them in one retry. Tools never reject by throwing, because the host discards a thrown message and shows only `Tool execution failed`.
+
+`grease_search` takes `limit` and `offset` and returns `total`, `offset`, and `hasMore` alongside the page. `limit` is the page size and is clamped to 100, which bounds one response rather than what a caller can reach. Walk the whole result set by raising `offset` by the page size until `hasMore` is false. Paging is applied after the filter and the sort, so it behaves the same against the active projection and the full catalog.
 
 ## Programmatic CLI
 
@@ -101,6 +103,7 @@ Grease also ships a dependency-free CLI for scripts and agents. Run these from t
 node ./scripts/grease.mjs schema --summary
 node ./scripts/grease.mjs status
 node ./scripts/grease.mjs search atrium --limit 5
+node ./scripts/grease.mjs search --status open --limit 100 --offset 100
 node ./scripts/grease.mjs brief --query atrium --limit 3
 node ./scripts/grease.mjs update <id> --status resolved --note "Fixed and validated"
 node ./scripts/grease.mjs update <id1> <id2> <id3> --status resolved --note "Closed in bulk"

@@ -44,3 +44,16 @@ async function runGrease(args) {
   });
   return JSON.parse(output);
 }
+
+test("CLI search exposes an offset flag and reports paging state", async () => {
+  const schemaResult = await runGrease(["schema"]);
+  const searchCommand = schemaResult.data.commands.find((command) => command.path.join(" ") === "search");
+  const flags = searchCommand.input.flags.map((flag) => flag.name);
+  assert.ok(flags.includes("--offset"), "search accepts --offset");
+
+  const page = await runGrease(["search", "--limit", "1", "--offset", "0"]);
+  assert.equal(page.ok, true);
+  assert.equal(page.data.offset, 0);
+  assert.equal(typeof page.data.total, "number");
+  assert.equal(typeof page.data.hasMore, "boolean");
+});

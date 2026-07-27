@@ -1445,3 +1445,47 @@ test("a manual capture keeps the source its author gave it", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+test("searchCatalog pages beyond the first 100 via offset and reports total and hasMore", async () => {
+  // A caller that cannot reach past the first page has to read catalog.json
+  // directly, which is how a 736-item catalog got triaged by hand. The 100-item
+  // clamp is a page size, not a ceiling on what is reachable.
+  const root = await tempRoot();
+  try {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz";
+    for (let i = 0; i < 125; i += 1) {
+      // The error text has to differ by letters, not digits. The error
+      // signature normalizes digits to a placeholder, so "denied 1" and
+      // "denied 2" are one friction and would not produce 125 items.
+      const token = alphabet[i % 26].repeat(1 + Math.floor(i / 26));
+      const [signal] = classifySessionEvent("tool.failure", {
+        toolName: "powershell",
+        toolCallId: `call-${i}`,
+        error: `Access denied for ${token}`
+      });
+      await appendEvent(occurredAt(signal, new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString()), { root });
+    }
+
+    const pageA = await searchCatalog({ status: "open", limit: 50, offset: 0 }, { root });
+    const pageB = await searchCatalog({ status: "open", limit: 50, offset: 50 }, { root });
+    const pageC = await searchCatalog({ status: "open", limit: 50, offset: 100 }, { root });
+
+    assert.equal(pageA.total, 125, "the total counts every match, not just the page");
+    assert.equal(pageA.items.length, 50);
+    assert.equal(pageA.hasMore, true);
+    assert.equal(pageC.items.length, 25, "the last page is reachable");
+    assert.equal(pageC.hasMore, false);
+
+    const ids = [pageA, pageB, pageC].map((page) => page.items.map((item) => item.id));
+    const union = new Set(ids.flat());
+    assert.equal(union.size, 125, "the three pages are disjoint and cover every match");
+
+    const everything = await searchCatalog({ status: "open", limit: 100, offset: 0 }, { root });
+    assert.equal(everything.items.length, 100, "the clamp is a page size");
+    assert.equal(everything.hasMore, true);
+
+    const defaulted = await searchCatalog({ status: "open", limit: 50 }, { root });
+    assert.deepEqual(defaulted.items.map((item) => item.id), ids[0], "offset defaults to the first page");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -425,3 +425,49 @@ test("grease_update with an out-of-enum status lists the accepted values", async
     await rm(root, { recursive: true, force: true });
   }
 });
+test("grease_search pages through the full result set and reports how far along it is", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    for (const token of ["alpha", "bravo", "charlie"]) {
+      const captured = await callTool(tools.get("grease_capture"), {
+        title: `Paging fixture ${token}`,
+        summary: `A distinct friction named ${token}.`,
+        severity: "low",
+        kind: "tool-error",
+        source: "paging-test",
+        evidence: `Fixture ${token}.`
+      });
+      assert.equal(captured.ok, true);
+    }
+
+    const first = await callTool(tools.get("grease_search"), { query: "paging fixture", limit: 2, offset: 0 });
+    const second = await callTool(tools.get("grease_search"), { query: "paging fixture", limit: 2, offset: 2 });
+
+    assert.equal(first.data.total, 3);
+    assert.equal(first.data.offset, 0);
+    assert.equal(first.data.items.length, 2);
+    assert.equal(first.data.hasMore, true);
+    assert.equal(second.data.offset, 2);
+    assert.equal(second.data.items.length, 1);
+    assert.equal(second.data.hasMore, false);
+
+    const seen = new Set([...first.data.items, ...second.data.items].map((item) => item.id));
+    assert.equal(seen.size, 3, "the two pages together cover every match exactly once");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("grease_search rejects a wrong-typed offset instead of silently ignoring it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
+  try {
+    const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
+    const result = await rawCallTool(tools.get("grease_search"), { offset: "100" });
+
+    assert.equal(result.payload.ok, false);
+    assert.equal(problemFor(result.payload, "offset").problem, "wrong type");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
