@@ -24,8 +24,12 @@ test("grease pr1 decouple capture: grease_capture and grease_update preserve eve
     assert.equal(typeof capture.data.eventId, "string");
     assert.equal(capture.data.itemCount, 1);
 
+    // grease_update takes a catalog item id; a capture event id does not resolve to one.
+    const { items } = await searchCatalog({}, { root });
+    const itemId = items[0].id;
+
     const update = await callTool(tools.get("grease_update"), {
-      id: capture.data.eventId,
+      id: itemId,
       status: "resolved"
     });
     assert.deepEqual(Object.keys(update.data).sort(), ["eventId", "itemCount"]);
@@ -260,7 +264,11 @@ test("an injected clock stamps captures and updates without reaching the store l
     });
     assert.equal(capture.data.itemCount, 1);
 
-    await callTool(tools.get("grease_update"), { id: capture.data.eventId, status: "resolved" });
+    // grease_update takes a catalog item id; a capture event id does not resolve to one.
+    const { items } = await searchCatalog({}, { root });
+    const itemId = items[0].id;
+
+    await callTool(tools.get("grease_update"), { id: itemId, status: "resolved" });
 
     const events = (await readFile(pathsForStore(root).events, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
     assert.equal(events.length, 2);

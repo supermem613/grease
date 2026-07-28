@@ -440,20 +440,54 @@ export async function getFriction(id, options = {}) {
   return { item, occurrences };
 }
 
+function knownItemIdsFromEvents(events) {
+  const known = new Set();
+  for (const event of events ?? []) {
+    if (event?.type === "friction.signal") {
+      known.add(event.frictionId ?? fingerprintSignal(event));
+    }
+  }
+  return known;
+}
+
+async function notFoundUpdateEnvelope(ids, root) {
+  const catalog = await readCatalog({ root });
+  return {
+    notFound: true,
+    recovery: "No Grease item matches this id. Run grease_search with a title, tool name, or symptom to find the current item id.",
+    nearestMatches: nearestFrictionMatches(ids[0], catalog.items),
+    ...(ids.length > 1 ? { missingIds: ids } : {})
+  };
+}
+
 export async function updateFriction(id, updates, options = {}) {
   if (!id) {
     throw new Error("id is required");
   }
   const allowed = normalizeFrictionUpdates(updates);
-  const event = {
-    type: "friction.update",
-    at: options.now ?? new Date().toISOString(),
-    itemId: id,
-    updates: allowed
-  };
-  const result = await appendEvent(event, options);
-  const catalog = await readCatalog(options);
-  return { event: result.event, catalog };
+  const root = options.root ?? defaultStoreRoot();
+  const at = options.now ?? new Date().toISOString();
+  const outcome = await enqueueAppendWrite(root, async () => {
+    await ensureStore(root);
+    const known = knownItemIdsFromEvents(await readEvents({ root }));
+    if (!known.has(id)) {
+      return { missing: [id] };
+    }
+    const entry = normalizeEvent({
+      type: "friction.update",
+      at,
+      itemId: id,
+      updates: allowed
+    }, options);
+    await appendFile(eventsPath(root), `${JSON.stringify(entry)}\n`, "utf8");
+    return { event: entry };
+  });
+  if (outcome.missing) {
+    return await notFoundUpdateEnvelope(outcome.missing, root);
+  }
+  await maintainProjectionAfterAppend(root);
+  const catalog = await readCatalog({ ...options, root });
+  return { event: outcome.event, catalog };
 }
 
 export async function updateFrictionBulk(ids, updates, options = {}) {
@@ -463,12 +497,19 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
   const allowed = normalizeFrictionUpdates(updates);
   const root = options.root ?? defaultStoreRoot();
   const at = options.now ?? new Date().toISOString();
-  await enqueueAppendWrite(root, async () => {
+  const outcome = await enqueueAppendWrite(root, async () => {
     await ensureStore(root);
     for (const id of ids) {
       if (!id) {
         throw new Error("id is required");
       }
+    }
+    const known = knownItemIdsFromEvents(await readEvents({ root }));
+    const missing = ids.filter((id) => !known.has(id));
+    if (missing.length > 0) {
+      return { missing };
+    }
+    for (const id of ids) {
       const normalized = normalizeEvent({
         type: "friction.update",
         at,
@@ -477,7 +518,11 @@ export async function updateFrictionBulk(ids, updates, options = {}) {
       }, options);
       await appendFile(eventsPath(root), `${JSON.stringify(normalized)}\n`, "utf8");
     }
+    return {};
   });
+  if (outcome.missing) {
+    return await notFoundUpdateEnvelope(outcome.missing, root);
+  }
   await maintainProjectionAfterAppend(root);
   const catalog = await readCatalog({ ...options, root });
   return { ids, catalog };

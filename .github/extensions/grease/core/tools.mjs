@@ -195,12 +195,18 @@ export function createGreaseTools(options = {}) {
         }
         if (bulk) {
           const result = await updateFrictionBulk(ids, updates, storeOptionsAtNow());
+          if (result.notFound === true) {
+            return success("grease_update", result);
+          }
           return success("grease_update", {
             itemIds: result.ids,
             itemCount: result.catalog.items.length
           });
         }
         const result = await updateFriction(id, updates, storeOptionsAtNow());
+        if (result.notFound === true) {
+          return success("grease_update", result);
+        }
         return success("grease_update", {
           eventId: result.event.id,
           itemCount: result.catalog.items.length

@@ -80,12 +80,18 @@ async function dispatch(name, argv) {
     };
     if (ids.length > 1) {
       const result = await updateFrictionBulk(ids, updates);
+      if (result.notFound === true) {
+        return ok("update", result);
+      }
       return ok("update", {
         itemIds: result.ids,
         itemCount: result.catalog.items.length
       });
     }
     const result = await updateFriction(ids[0], updates);
+    if (result.notFound === true) {
+      return ok("update", result);
+    }
     return ok("update", {
       eventId: result.event.id,
       itemCount: result.catalog.items.length
