@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { getFriction, pathsForStore, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "../.github/extensions/grease/core/catalog.mjs";
+import { getFriction, pathsForStore, pruneOrphanedUpdates, readCatalogSummary, searchCatalog, updateFriction, updateFrictionBulk } from "../.github/extensions/grease/core/catalog.mjs";
 import { buildBrief } from "../.github/extensions/grease/core/brief.mjs";
 
 const VERSION = "0.1.0";
@@ -11,6 +11,7 @@ const registry = [
   command(["search"], "Search friction items.", "read", ["query"], ["--status", "--limit", "--offset"]),
   command(["get"], "Get one friction item with occurrences.", "read", ["id"]),
   command(["update"], "Update one or more friction items.", "mutate-local", ["id"], ["--status", "--severity", "--tag", "--note"]),
+  command(["prune"], "Report or remove friction updates whose item id no longer resolves.", "mutate-local", [], ["--root", "--apply"]),
   command(["brief"], "Generate a kickoff prompt from friction items.", "read", [], ["--id", "--query", "--status", "--limit"])
 ];
 
@@ -96,6 +97,13 @@ async function dispatch(name, argv) {
       eventId: result.event.id,
       itemCount: result.catalog.items.length
     });
+  }
+  if (name === "prune") {
+    const result = await pruneOrphanedUpdates({
+      root: typeof parsed.flags.root === 'string' ? parsed.flags.root : undefined,
+      apply: parsed.flags.apply === true
+    });
+    return ok("prune", result);
   }
   if (name === "brief") {
     return ok("brief", await buildBrief(requestInput(parsed)));

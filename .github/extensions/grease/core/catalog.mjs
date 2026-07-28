@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { classifyToolSource, errorSignature } from "./classifier.mjs";
 
-const CATALOG_VERSION = 6;
+const CATALOG_VERSION = 7;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
@@ -366,6 +366,40 @@ function findLastNonEmptyLine(buffer, reachedStart) {
   return undefined;
 }
 
+// Default to a dry run because an orphaned update may still be recoverable and
+// deleting it destroys recorded triage history.
+export async function pruneOrphanedUpdates(options = {}) {
+  const root = options.root ?? defaultStoreRoot();
+  const apply = options.apply === true;
+  const result = await enqueueAppendWrite(root, async () => {
+    await ensureStore(root);
+    const events = await readEvents({ root });
+    const known = knownItemIdsFromEvents(events);
+    const orphaned = events.filter((event) => event.type === "friction.update" && !known.has(event.itemId));
+    const orphanedItemIds = [...new Set(orphaned.map((event) => event.itemId))].sort();
+    if (!apply) {
+      return { dryRun: true, orphanedUpdates: orphaned.length, orphanedItemIds, removed: 0, backupPath: null };
+    }
+    if (orphaned.length === 0) {
+      return { dryRun: false, orphanedUpdates: 0, orphanedItemIds: [], removed: 0, backupPath: null };
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = `${eventsPath(root)}.backup-${stamp}`;
+    await writeFile(backupPath, await readFile(eventsPath(root), "utf8"), "utf8");
+    const orphanedSet = new Set(orphaned);
+    const surviving = events.filter((event) => !orphanedSet.has(event));
+    const serialized = surviving.map((event) => JSON.stringify(event)).join("\n");
+    const tempPath = `${eventsPath(root)}.prune-${stamp}.tmp`;
+    await writeFile(tempPath, serialized.length > 0 ? `${serialized}\n` : "", "utf8");
+    await rename(tempPath, eventsPath(root));
+    return { dryRun: false, orphanedUpdates: orphaned.length, orphanedItemIds, removed: orphaned.length, backupPath };
+  });
+  if (result.removed > 0) {
+    await rebuildCatalog({ root });
+  }
+  return result;
+}
+
 export async function readCatalogSummary(options = {}) {
   const root = options.root ?? defaultStoreRoot();
   const active = await readActiveCatalog({ ...options, root });
@@ -373,7 +407,8 @@ export async function readCatalogSummary(options = {}) {
   return {
     counts: {
       total,
-      open: active.statusCounts?.open ?? 0
+      open: active.statusCounts?.open ?? 0,
+      orphanedUpdates: active.orphanedUpdates ?? 0
     },
     paths: pathsForStore(root)
   };
@@ -583,9 +618,11 @@ export function buildCatalog(events, options = {}) {
     }
   }
 
+  let orphanedUpdates = 0;
   for (const update of updates) {
     const item = items.get(update.itemId);
     if (!item) {
+      orphanedUpdates += 1;
       continue;
     }
     const changes = update.updates ?? {};
@@ -618,6 +655,7 @@ export function buildCatalog(events, options = {}) {
     generationId,
     sourceEventLogBytes,
     sourceEventLogMtimeMs,
+    orphanedUpdates,
     items: [...items.values()].sort(sortItems)
   };
 }
@@ -1137,7 +1175,8 @@ function buildActiveProjection(catalog) {
     sourceEventLogBytes: catalog.sourceEventLogBytes,
     sourceEventLogMtimeMs: catalog.sourceEventLogMtimeMs,
     items: items.map((item) => ({ ...item })),
-    statusCounts
+    statusCounts,
+    orphanedUpdates: catalog.orphanedUpdates ?? 0
   };
 }
 

@@ -40,7 +40,7 @@ test("grease pr1 decouple capture: grease_capture and grease_update preserve eve
   }
 });
 
-test("grease pr2 bounded projection: grease_get returns reconstructed occurrence evidence at version 6", async () => {
+test("grease pr2 bounded projection: grease_get returns reconstructed occurrence evidence at version 7", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "grease-test-"));
   try {
     const tools = new Map(createGreaseTools({ root }).map((tool) => [tool.name, tool]));
@@ -55,7 +55,7 @@ test("grease pr2 bounded projection: grease_get returns reconstructed occurrence
 
     const paths = pathsForStore(root);
     const catalogFile = JSON.parse(await readFile(paths.catalog, "utf8"));
-    assert.equal(catalogFile.version, 6, "pr2: catalog.json must be version 6");
+    assert.equal(catalogFile.version, 7, "pr2: catalog.json must be version 7");
     assert.equal(catalogFile.occurrences, undefined, "pr2: catalog.json must omit occurrences[]");
 
     const { items } = await searchCatalog({ query: "PR2 bounded" }, { root });
@@ -192,7 +192,7 @@ test("grease status tool preserves its public result shape from the active summa
     const result = await callTool(tools.get("grease_status"), {});
     assert.equal(result.ok, true);
     assert.equal(result.command, "grease_status");
-    assert.deepEqual(result.data.counts, { total: 1, open: 1 });
+    assert.deepEqual(result.data.counts, { total: 1, open: 1, orphanedUpdates: 0 });
     assert.deepEqual(result.data.paths, pathsForStore(root));
   } finally {
     await rm(root, { recursive: true, force: true });
