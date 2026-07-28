@@ -84,12 +84,14 @@ The extension registers these six tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `grease_status` | Show catalog health and paths. |
-| `grease_capture` | Capture model-observed operational friction that passive telemetry may not see. |
+| `grease_status` | Show catalog health and paths, including `orphanedUpdates`, the number of recorded updates whose item id no longer resolves. |
+| `grease_capture` | Capture model-observed operational friction that passive telemetry may not see and return the `itemId` of the item it created or updated, which is the `id` to pass to `grease_update`. |
 | `grease_search` | Search catalog items, one page at a time. |
 | `grease_get` | Inspect one item with evidence. |
-| `grease_update` | Change status, severity, tags, or note on one item (`id`) or many items at once (`ids`). |
+| `grease_update` | Change status, severity, tags, or note on one item (`id`) or many items at once (`ids`). An `id` that does not resolve to an existing item is rejected with a `notFound` result and nothing is recorded; a bulk update applies to every `id` or none. |
 | `grease_brief` | Generate a kickoff prompt from one or more items. |
+
+A Grease item id identifies a friction item, while an event id identifies a log entry. Only an item id resolves for `grease_update`, so a caller should record the item id returned by `grease_capture` rather than guess one.
 
 Every tool reports a rejected call as a normal result whose payload carries `ok: false`, a `problems` array naming each offending argument, and a `recovery` line. Missing arguments, wrong types, and values outside an accepted set are all reported together, so a caller fixes them in one retry. Tools never reject by throwing, because the host discards a thrown message and shows only `Tool execution failed`.
 
@@ -107,7 +109,12 @@ node ./scripts/grease.mjs search --status open --limit 100 --offset 100
 node ./scripts/grease.mjs brief --query atrium --limit 3
 node ./scripts/grease.mjs update <id> --status resolved --note "Fixed and validated"
 node ./scripts/grease.mjs update <id1> <id2> <id3> --status resolved --note "Closed in bulk"
+node ./scripts/grease.mjs prune
+node ./scripts/grease.mjs prune --apply
+node ./scripts/grease.mjs prune --root <store>
 ```
+
+`grease prune` reports orphaned updates and their item ids without changing anything. `grease prune --apply` removes them after writing a full backup of the event log, and `--root` targets a specific store.
 
 Non-interactive commands write JSON only to stdout. The `schema` command is the source of truth for supported commands.
 

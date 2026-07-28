@@ -489,6 +489,7 @@ async function notFoundUpdateEnvelope(ids, root) {
   const catalog = await readCatalog({ root });
   return {
     notFound: true,
+    id: ids[0],
     recovery: "No Grease item matches this id. Run grease_search with a title, tool name, or symptom to find the current item id.",
     nearestMatches: nearestFrictionMatches(ids[0], catalog.items),
     ...(ids.length > 1 ? { missingIds: ids } : {})

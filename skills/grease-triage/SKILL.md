@@ -19,7 +19,7 @@ There is no UI. The entire loop runs through the six Grease agent tools (or the 
 3. **Inspect** — Use `grease_get` on a single item id to read its full evidence: the occurrences, tool names, error messages, and session context behind the item.
 4. **Brief** — Use `grease_brief` with one or more item ids (or a query) to generate a kickoff prompt for a fix-it session. The brief carries the closure instruction so the fixing session knows to mark items resolved after validation.
 5. **Capture (as needed)** — Use `grease_capture` to manually record friction the passive event stream cannot see.
-6. **Close** — After a fix is validated, use `grease_update` to change status, severity, tags, or a note.
+6. **Close** — After a fix is validated, use `grease_update` to change status, severity, tags, or a note. `grease_update` returns `notFound` when the id does not resolve; a `notFound` result means nothing was recorded and the update must be retried against a real id found with `grease_search`. A successful update returns an `eventId`.
 
 ## Capture discipline
 
@@ -81,7 +81,7 @@ Every backlog item created from triage must link to an approved POR with in-dept
 `grease_update` accepts either a single `id` or an `ids` array.
 
 - Close one item: pass `id` with the update fields.
-- Close many items atomically: pass `ids` (an array of item ids). All listed items receive the same update in a single catalog write, so the catalog is never left half-updated.
+- Close many items atomically: pass `ids` (an array of item ids). All listed items receive the same update in a single catalog write, so the catalog is never left half-updated. A bulk update is atomic and fails entirely when any id is unknown.
 
 Only close items after the underlying friction is actually fixed and validated. Re-run the failing tool or reproduce the original error to confirm it no longer occurs. A resolved item should reflect a validated fix, not a dismissal.
 

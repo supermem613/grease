@@ -21,6 +21,7 @@ test('updateFriction rejects an itemId that does not exist', async () => {
     const result = await updateFriction('9cb748027a0daf36', { status: 'resolved' }, { root });
 
     assert.equal(result.notFound, true);
+    assert.equal(result.id, '9cb748027a0daf36');
     assert.equal(result.event, undefined);
     assert.equal((await readEvents({ root })).length, before.length);
   } finally {
