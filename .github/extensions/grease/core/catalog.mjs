@@ -8,6 +8,7 @@ import { classifyToolSource, errorSignature } from "./classifier.mjs";
 const CATALOG_VERSION = 7;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
+const CLOSED_STATUSES = ["resolved", "ignored"];
 const STORE_LOCK_TIMEOUT_MS = 10_000;
 const STORE_LOCK_GRACE_MS = 5_000;
 const FILE_REPLACE_TIMEOUT_MS = 2_000;
@@ -640,6 +641,17 @@ export function buildCatalog(events, options = {}) {
       item.latestNote = changes.note;
     }
     item.updatedAt = update.at;
+  }
+
+  // A closed item reopens on recurrence because closing is a claim that the
+  // friction is fixed, and a later occurrence disproves that claim. Without
+  // this, a resolved item stays resolved forever and recurrence is invisible to
+  // a status=open search.
+  for (const item of items.values()) {
+    if (CLOSED_STATUSES.includes(item.status) && item.updatedAt !== undefined && String(item.lastSeen) > String(item.updatedAt)) {
+      item.status = "open";
+      item.reopenedAt = item.lastSeen;
+    }
   }
 
   const occurrencesByRecency = [...occurrences].sort((a, b) => String(b.at).localeCompare(String(a.at)));
