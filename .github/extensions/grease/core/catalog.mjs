@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { classifyToolSource, errorSignature } from "./classifier.mjs";
 
-const CATALOG_VERSION = 7;
+const CATALOG_VERSION = 8;
 const ACTIVE_STATUSES = ["open", "triaged", "in-progress"];
 const ALL_STATUSES = ["open", "triaged", "in-progress", "resolved", "ignored"];
 const CLOSED_STATUSES = ["resolved", "ignored"];

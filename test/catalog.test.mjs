@@ -61,7 +61,7 @@ test("grease pr1 decouple capture: append leaves projections byte-identical and 
   }
 });
 
-test("grease pr2 bounded projection: occurrences reconstructed from log and version-5 projection rebuilds to version 7", async () => {
+test("grease pr2 bounded projection: occurrences reconstructed from log and version-5 projection rebuilds to version 8", async () => {
   const root = await tempRoot();
   try {
     const [firstSignal] = classifySessionEvent("tool.execution_complete", {
@@ -89,15 +89,15 @@ test("grease pr2 bounded projection: occurrences reconstructed from log and vers
 
     const paths = pathsForStore(root);
     const catalog = await readCatalog({ root });
-    assert.equal(catalog.version, 7, "pr2: CATALOG_VERSION must be 7");
+    assert.equal(catalog.version, 8, "pr2: CATALOG_VERSION must be 8");
     assert.equal(catalog.occurrences, undefined, "pr2: in-memory catalog omits occurrences[]");
 
     const catalogFile = JSON.parse(await readFile(paths.catalog, "utf8"));
-    assert.equal(catalogFile.version, 7);
+    assert.equal(catalogFile.version, 8);
     assert.equal(catalogFile.occurrences, undefined, "pr2: catalog.json must omit occurrences[]");
 
     const activeFile = JSON.parse(await readFile(path.join(root, "active.json"), "utf8"));
-    assert.equal(activeFile.version, 7);
+    assert.equal(activeFile.version, 8);
     assert.equal(activeFile.occurrences, undefined, "pr2: active.json must omit occurrences[]");
 
     const item = catalog.items[0];
@@ -117,9 +117,9 @@ test("grease pr2 bounded projection: occurrences reconstructed from log and vers
     const staleVersionFiveCatalog = { ...catalogFile, version: 5, occurrences: [{ frictionId: item.id, at: item.latestOccurrence.at }] };
     await writeFile(paths.catalog, JSON.stringify(staleVersionFiveCatalog, null, 2), "utf8");
     const rebuilt = await readCatalog({ root });
-    assert.equal(rebuilt.version, 7, "pr2: a version-5 projection rebuilds to version 7");
+    assert.equal(rebuilt.version, 8, "pr2: a version-5 projection rebuilds to version 8");
     const rebuiltFile = JSON.parse(await readFile(paths.catalog, "utf8"));
-    assert.equal(rebuiltFile.version, 7);
+    assert.equal(rebuiltFile.version, 8);
     assert.equal(rebuiltFile.occurrences, undefined);
 
     const replay = buildCatalog([
@@ -379,7 +379,7 @@ test("grease pr4 temp sweeper: stray projection tmp removed under lock while unr
     assert.ok(events.some((event) => event.id === followUp.event.id), "pr4: the in-flight write is durable");
 
     const catalog = await readCatalog({ root });
-    assert.equal(catalog.version, 7, "pr4: the in-flight write's projection output survives");
+    assert.equal(catalog.version, 8, "pr4: the in-flight write's projection output survives");
     assert.ok(catalog.items.length >= 1, "pr4: the sweep leaves a valid rebuilt catalog");
 
     assert.equal(typeof catalogStore.sweepOrphanTempFiles, "function", "pr4: a lock-owned temp sweeper must exist");
