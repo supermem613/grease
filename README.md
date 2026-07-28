@@ -93,6 +93,8 @@ The extension registers these six tools:
 
 A Grease item id identifies a friction item, while an event id identifies a log entry. Only an item id resolves for `grease_update`, so a caller should record the item id returned by `grease_capture` rather than guess one.
 
+Closing an item is a claim that the friction is fixed. If the same friction is captured again after the item was closed, Grease reopens the item and records `reopenedAt`; only items that were `resolved` or `ignored` reopen, while `triaged` and `in-progress` remain active states and recurrence leaves them alone. As a result, a `status=open` search always reflects friction that is currently happening, so closing a batch of items cannot hide a problem that comes back.
+
 Every tool reports a rejected call as a normal result whose payload carries `ok: false`, a `problems` array naming each offending argument, and a `recovery` line. Missing arguments, wrong types, and values outside an accepted set are all reported together, so a caller fixes them in one retry. Tools never reject by throwing, because the host discards a thrown message and shows only `Tool execution failed`.
 
 `grease_search` takes `limit` and `offset` and returns `total`, `offset`, and `hasMore` alongside the page. `limit` is the page size and is clamped to 100, which bounds one response rather than what a caller can reach. Walk the whole result set by raising `offset` by the page size until `hasMore` is false. Paging is applied after the filter and the sort, so it behaves the same against the active projection and the full catalog.
