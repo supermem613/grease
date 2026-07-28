@@ -794,12 +794,18 @@ function normalizeEvent(event, options) {
     throw new Error(`event.at ${event.at} conflicts with the now option ${options.now}; pass the timestamp when the event is built rather than at append time`);
   }
   const at = event.at ?? options.now ?? new Date().toISOString();
-  return {
+  const normalized = {
     ...event,
     id: event.id ?? fingerprintEvent(event, at),
     at,
     machineName: event.machineName ?? options.machineName ?? os.hostname()
   };
+  if (normalized.type === "friction.signal" && normalized.frictionId === undefined) {
+    // Record the friction id at capture time so it becomes a stored fact.
+    // Recomputing it later at projection time silently re-keys the catalog and orphans every recorded update.
+    return { ...normalized, frictionId: fingerprintSignal(normalized) };
+  }
+  return normalized;
 }
 
 function fingerprintSignal(event) {

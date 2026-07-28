@@ -20,8 +20,9 @@ test("grease pr1 decouple capture: grease_capture and grease_update preserve eve
       source: "test",
       evidence: "Call the capture and update tools and inspect the returned payload"
     });
-    assert.deepEqual(Object.keys(capture.data).sort(), ["eventId", "itemCount"]);
+    assert.deepEqual(Object.keys(capture.data).sort(), ["eventId", "itemCount", "itemId"]);
     assert.equal(typeof capture.data.eventId, "string");
+    assert.equal(typeof capture.data.itemId, "string");
     assert.equal(capture.data.itemCount, 1);
 
     // grease_update takes a catalog item id; a capture event id does not resolve to one.

@@ -124,6 +124,7 @@ export function createGreaseTools(options = {}) {
         const catalog = await readCatalog(storeOptions);
         return success("grease_capture", {
           eventId: result.event.id,
+          itemId: result.event.frictionId,
           itemCount: catalog.items.length
         });
       }
