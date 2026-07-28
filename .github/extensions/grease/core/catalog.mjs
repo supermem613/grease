@@ -1241,7 +1241,8 @@ function nearestMatchScore(query, item) {
     return 50;
   }
   const queryPrefix = query.slice(0, 6);
-  return fields.some((field) => field.includes(queryPrefix)) ? 10 : 1;
+  // A non-matching item must score zero, because the caller filters on a positive score and a floor turns the list into noise.
+  return fields.some((field) => field.includes(queryPrefix)) ? 10 : 0;
 }
 
 function severityRank(value) {
